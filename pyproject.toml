@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rv-search-and-download"
+version = "0.1.0"
+description = "Find and download the radial velocity data behind NASA Exoplanet Archive planet masses."
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Lauren Weiss"}]
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    "astroquery>=0.4.10",
+    "dace-query>=3.0",
+]
+
+[project.scripts]
+rv-search-and-download = "rv_search_and_download.pipeline:main"
+rv-vizier-search = "rv_search_and_download.vizier_search:main"
+rv-ads-search = "rv_search_and_download.ads_search:main"
+rv-download-tables = "rv_search_and_download.download:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

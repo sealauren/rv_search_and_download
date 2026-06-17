@@ -1,0 +1,21 @@
+# Generated outputs (re-creatable by running the pipeline)
+cache/
+downloaded_rv_tables/
+vizier_rv_results.csv
+ads_rv_instruments.csv
+
+# Large source catalogs -- fetch your own from the NASA Exoplanet Archive
+# rather than committing them (see README). Anything matching these
+# patterns stays local only.
+NEA_Multis.csv
+PSCompPars_*.csv
+
+# Python packaging
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# OS
+.DS_Store
