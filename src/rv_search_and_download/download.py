@@ -7,13 +7,19 @@ Combines the outputs of vizier_search.py and ads_search.py:
   - If a reference mentions the "California Legacy Survey" / "CLS", the
     actual RV table lives in Rosenthal et al. 2021's VizieR catalog
     (J/ApJS/255/8/table6), not the citing paper -- download that instead.
-  - If a reference mentions "DACE", query the DACE archive directly for
-    that host star's RV time series (public API, no auth needed for
-    published data).
+  - If a reference mentions "DACE", or names a DACE-pipeline spectrograph
+    (ESPRESSO, HARPS, HARPS-N, CORALIE, CARMENES, SOPHIE), query the DACE
+    archive directly for that host star's RV time series (public API, no
+    auth needed for published data).
+  - DACE is also queried directly for *every* host with a reported Msini
+    mass, regardless of whether a VizieR/CLS source was already resolved
+    -- DACE's API needs no textual clue to try, and an independent dataset
+    there is valuable even when another source already exists.
 
-Hosts where only a bare instrument name was found (no VizieR table, no CLS/
-DACE) are reported but not downloaded -- there's no machine-readable
-location to fetch from without manual archive lookup.
+Hosts where only a bare, non-DACE instrument name was found (no VizieR
+table, no CLS/DACE, and DACE itself returned no data) are reported but not
+downloaded -- there's no machine-readable location to fetch from without
+manual archive lookup.
 
 Each saved CSV has a '#'-commented header describing the source, reference,
 and column names/units/descriptions (pulled from VizieR's table metadata,
@@ -33,10 +39,44 @@ import pandas as pd
 from astroquery.vizier import Vizier
 from dace_query.spectroscopy import Spectroscopy
 
+from .ads_search import DACE_PIPELINE_INSTRUMENTS
+
 ROSENTHAL_BIBCODE = "2021ApJS..255....8R"
 ROSENTHAL_CATALOG = "J/ApJS/255/8"
 ROSENTHAL_TABLE = "J/ApJS/255/8/table6"
 ROSENTHAL_DISPLAY = "Rosenthal et al. 2021"
+
+# table6 is a single ~104,720-row table spanning ~700 different California
+# Legacy Survey targets, keyed by this "CPS" identifier column -- a bare HD
+# number, or a lowercase "gl<n>"/"hip<n>" catalog id with no space. Without
+# filtering by it, every host redirected here would get the *entire*
+# survey's RVs, not just its own.
+ROSENTHAL_ID_COLUMN = "CPS"
+
+HD_RE = re.compile(r'^HD\s*(\d+)', re.IGNORECASE)
+GJ_RE = re.compile(r'^G[JL]\s*(\d+)', re.IGNORECASE)
+HIP_RE = re.compile(r'^HIP\s*(\d+)', re.IGNORECASE)
+
+
+def host_to_cps_id(hostname):
+    """Best-effort guess at this host's identifier in Rosenthal et al.
+    2021's CLS table. Returns None if the hostname doesn't match one of
+    the catalog-number patterns CPS uses for its bare/lowercase ids --
+    CPS also has BD/Giclas/LHS designations and lettered multiple-star
+    components we don't attempt to cover, so callers must treat None (or
+    a guess that matches zero rows) as "could not isolate this host" and
+    not fall back to handing over the unfiltered, all-stars table.
+    """
+    m = HD_RE.match(hostname)
+    if m:
+        return m.group(1)
+    m = GJ_RE.match(hostname)
+    if m:
+        return f"gl{m.group(1)}"
+    m = HIP_RE.match(hostname)
+    if m:
+        return f"hip{m.group(1)}"
+    return None
 
 DACE_KEY_COLUMNS = {
     "rjd": "Reduced Julian Date (JD - 2400000)",
@@ -82,7 +122,39 @@ def resolve_sources(vizier_csv, ads_csv):
     for _, r in ads[ads["mentions_dace"] & ads["hostname"].isin(msini_hosts)].iterrows():
         existing = sources.setdefault(r["hostname"], [])
         if not any(e["type"] == "dace" for e in existing):
-            existing.append({"type": "dace", "bibcode": r["bibcode"], "display": r["display"]})
+            cited = {i.strip() for i in str(r.get("rv_instruments") or "").split(",") if i.strip()}
+            dace_instruments = cited & DACE_PIPELINE_INSTRUMENTS
+            clue = (f"names {', '.join(sorted(dace_instruments))} (DACE-pipeline instrument)"
+                    if dace_instruments else "mentions DACE")
+            existing.append({
+                "type": "dace", "bibcode": r["bibcode"], "display": r["display"], "dace_clue": clue,
+            })
+
+    # Always try DACE directly for every Msini host, regardless of whether
+    # a VizieR/CLS source was already resolved or an ads-search clue named
+    # DACE explicitly. DACE's public API needs no textual clue to query --
+    # it's just a target-name lookup -- and an independent RV dataset
+    # there is valuable even when another source already exists (e.g. a
+    # VizieR table from one paper, DACE RVs combining several others).
+    for hostname in msini_hosts:
+        existing = sources.setdefault(hostname, [])
+        if not any(e["type"] == "dace" for e in existing):
+            existing.append({
+                "type": "dace", "bibcode": None, "display": None,
+                "dace_clue": "queried directly (DACE is checked for every host with a reported Msini mass)",
+            })
+
+    # Multi-target survey tables (currently just Rosenthal et al. 2021's
+    # CLS table6) need per-host row filtering no matter how a host ended
+    # up pointed at them -- whether it directly cites Rosenthal+2021 itself
+    # (the "direct" loop above) or got redirected here because some other
+    # paper just said "California Legacy Survey" (the "mentions_cls" loop).
+    # Annotated centrally so both paths get the same filtering treatment.
+    for hostname, host_sources in sources.items():
+        for s in host_sources:
+            if s["type"] == "vizier" and s["table_id"] == ROSENTHAL_TABLE:
+                s["multi_target"] = True
+                s["target_filter"] = (ROSENTHAL_ID_COLUMN, host_to_cps_id(hostname))
 
     return sources, msini_hosts
 
@@ -126,14 +198,32 @@ def download_vizier_table(hostname, source, out_dir):
         print(f"  ! no data returned for {source['table_id']}")
         return None
 
+    filter_note = None
+    if source.get("multi_target"):
+        n_total = len(table)
+        print(f"  ! WARNING: {source['table_id']} is a survey-wide table covering "
+              f"many different stars, not just {hostname} ({n_total} rows total) -- "
+              "filtering to this host's rows only")
+        col, target_id = source.get("target_filter") or (None, None)
+        if col and target_id and col in table.colnames:
+            table = table[[str(row_val).strip().lower() == target_id.lower() for row_val in table[col]]]
+            print(f"    kept {len(table)}/{n_total} rows matching {col}={target_id}")
+            filter_note = f"Filtered from the full {n_total}-row survey table to rows where {col}={target_id}"
+        if not col or not target_id or len(table) == 0:
+            print(f"    ! could not isolate {hostname}'s rows in this multi-target table "
+                  "(no reliable id match) -- skipping rather than saving every star's RVs under this host")
+            return None
+
     lines = [
         f"# Host: {hostname}",
         f"# Source: VizieR catalog {source['catalog']} (table {source['table_id']})",
         f"# Reference: {source['display']} ({source['bibcode']})",
         f"# ADS: https://ui.adsabs.harvard.edu/abs/{source['bibcode']}/abstract",
         f"# Retrieved via astroquery.vizier on {date.today().isoformat()}",
-        "# Columns:",
     ]
+    if filter_note:
+        lines.append(f"# NOTE: {filter_note}")
+    lines.append("# Columns:")
     for c in table.colnames:
         unit = table[c].unit
         desc = table[c].description or ""
@@ -158,11 +248,13 @@ def download_dace_table(hostname, source, out_dir):
         print(f"  ! DACE returned no data for {target}")
         return None
 
+    trigger_line = (f"# Triggered by: {source['display']} ({source['bibcode']}) -- {source['dace_clue']}"
+                     if source.get("display") else f"# Triggered by: {source['dace_clue']}")
     lines = [
         f"# Host: {hostname}",
         "# Source: DACE archive (public mode, dace_query.spectroscopy.Spectroscopy.get_timeseries)",
         f"# Target queried: {target}",
-        f"# Triggered by: {source['display']} ({source['bibcode']}) mentioning DACE",
+        trigger_line,
         f"# Retrieved via dace_query on {date.today().isoformat()}",
         f"# {len(df.columns)} total columns returned; key columns:",
     ]

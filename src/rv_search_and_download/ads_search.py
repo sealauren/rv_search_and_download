@@ -4,18 +4,28 @@ paper actually used -- a clue that the paper is reusing archival RVs (common
 for nearby bright stars) rather than presenting its own VizieR-mirrored
 dataset.
 
-Two-tier search:
+Three-tier search:
   1. ADS abstract (fast, works for any paper ADS indexes).
-  2. If tier 1 finds nothing, full text of the arXiv preprint via ar5iv.org
-     (LaTeXML HTML rendering -- no PDF parsing needed). The arXiv id is
-     resolved from ADS's `identifier` field, which works even when the
-     paper's canonical bibcode is the published (non-arXiv) version.
+  2. If tier 1 finds nothing and the paper has an arXiv id, full text of
+     the arXiv preprint via ar5iv.org (LaTeXML HTML rendering -- no PDF
+     parsing needed). The arXiv id is resolved from ADS's `identifier`
+     field, which works even when the paper's canonical bibcode is the
+     published (non-arXiv) version. LaTeXML can fail to render a paper
+     (common for Nature-formatted submissions) while still returning
+     HTTP 200 -- that's detected and treated as "couldn't check", not as
+     a confirmed empty result.
+  3. If tiers 1-2 still find nothing -- including when there's no arXiv
+     id at all, or ar5iv failed to render -- ADS's own full-text search
+     index, which is built from the publisher and isn't subject to
+     arXiv/LaTeXML rendering failures.
 
 Two special-case redirects this also flags:
   - "California Legacy Survey" / "CLS" -> the actual RV table lives in
     Rosenthal et al. 2021 (2021ApJS..255...8R), not the citing paper.
-  - "DACE" -> the RVs live in the DACE archive and must be queried there
-    rather than downloaded from a VizieR table.
+  - "DACE", or a named DACE-pipeline spectrograph (ESPRESSO, HARPS,
+    HARPS-N, CORALIE, CARMENES) -> the RVs likely live in the DACE
+    archive and must be queried there rather than downloaded from a
+    VizieR table.
 
 Requires an ADS API token (free, from https://ui.adsabs.harvard.edu/user/settings/token)
 set as the $ADS_API_TOKEN environment variable.
@@ -33,6 +43,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+
+from .vizier_search import unresolved_provenance_refs
 
 ADS_URL = "https://api.adsabs.harvard.edu/v1/search/query"
 AR5IV_URL = "https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
@@ -56,6 +68,15 @@ ARCHIVAL_RE = re.compile(
 )
 CLS_RE = re.compile(r"California Legacy Survey|\bCLS\b")
 DACE_RE = re.compile(r"\bDACE\b")
+
+# These spectrographs' public RV time series are routinely archived in
+# DACE even when a paper never says the word "DACE" -- a paper just naming
+# one of them is itself a DACE clue (see find_rv_clues below). Originally
+# just the Geneva Observatory pipeline instruments (ESPRESSO/HARPS/
+# HARPS-N/CORALIE); CARMENES and SOPHIE added per direct confirmation that
+# their public RVs are also mirrored there.
+DACE_PIPELINE_INSTRUMENTS = {"ESPRESSO", "HARPS-N", "HARPS", "CORALIE", "CARMENES", "SOPHIE"}
+
 ARXIV_IDENTIFIER_RE = re.compile(r"^arXiv:(.+)$")
 
 
@@ -100,22 +121,78 @@ def fetch_ads_record(bibcode, token, session):
     return title, abstract, arxiv_id
 
 
+# LaTeXML (the engine behind ar5iv) can fail to render a paper's LaTeX --
+# common for Nature-formatted submissions -- and still return an HTTP 200
+# page saying so, rather than an error status. Treating that page's
+# (near-empty) text as "the full text, which mentions no RV instrument"
+# would be wrong: we never actually read the paper.
+AR5IV_FAILURE_MARKER = "Conversion to HTML had a Fatal error"
+
+
 def fetch_ar5iv_fulltext(arxiv_id, session):
     resp = session.get(AR5IV_URL.format(arxiv_id=arxiv_id), headers=HEADERS, timeout=60)
     if resp.status_code != 200:
         return None
     soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text(" ")
+    text = soup.get_text(" ")
+    if AR5IV_FAILURE_MARKER in text:
+        return None
+    return text
 
 
 def find_rv_clues(text):
     if not text:
         return {"instruments": [], "archival": False, "cls": False, "dace": False}
+    instruments = sorted(set(INSTRUMENT_RE.findall(text)))
     return {
-        "instruments": sorted(set(INSTRUMENT_RE.findall(text))),
+        "instruments": instruments,
         "archival": bool(ARCHIVAL_RE.search(text)),
         "cls": bool(CLS_RE.search(text)),
-        "dace": bool(DACE_RE.search(text)),
+        "dace": bool(DACE_RE.search(text)) or bool(DACE_PIPELINE_INSTRUMENTS & set(instruments)),
+    }
+
+
+def fetch_ads_fulltext_clues(bibcode, token, session):
+    """Query ADS's own full-text search index (built from the publisher,
+    not arXiv/LaTeXML) for RV instrument/CLS/DACE keywords -- a fallback
+    for papers ar5iv can't render, or that have no arXiv id at all. ADS
+    indexes full text independent of arXiv's HTML conversion pipeline, so
+    it isn't subject to the same rendering failures.
+
+    Returns a clues dict in the same shape as find_rv_clues, or None if the
+    ADS query itself fails (network error) -- as opposed to a confirmed
+    "zero matches" result, which is a legitimate, cacheable answer and
+    returned normally.
+
+    Does one combined existence query first (cheap), and only follows up
+    with per-instrument queries -- to find out *which* instrument(s) hit --
+    for the rare paper where that combined query found something.
+    """
+    def fulltext_hit(query):
+        resp = session.get(
+            ADS_URL,
+            params={"q": f"bibcode:{bibcode} AND full:({query})", "fl": "bibcode"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["response"]["numFound"] > 0
+
+    all_terms = RV_INSTRUMENTS + ["DACE", "California Legacy Survey"]
+    try:
+        if not fulltext_hit(" OR ".join(f'"{t}"' for t in all_terms)):
+            return {"instruments": [], "archival": False, "cls": False, "dace": False}
+        instruments = [i for i in RV_INSTRUMENTS if fulltext_hit(f'"{i}"')]
+        cls_hit = fulltext_hit('"California Legacy Survey" OR "CLS"')
+        dace_hit = fulltext_hit('"DACE"')
+    except requests.RequestException:
+        return None
+
+    return {
+        "instruments": sorted(instruments),
+        "archival": False,
+        "cls": cls_hit,
+        "dace": dace_hit or bool(DACE_PIPELINE_INSTRUMENTS & set(instruments)),
     }
 
 
@@ -125,16 +202,14 @@ def has_any_clue(clues):
 
 def missing_rv_references(results_path):
     """Reproduce the same 'RV provenance but no VizieR table' set that
-    vizier_rv_search.py reports at the end of its run."""
+    vizier_search.py reports at the end of its run."""
     df = pd.read_csv(results_path)
-    rv_hosts = set(df.loc[df["looks_like_rv"], "hostname"].unique())
-    missing = df[df["rv_provenance"] & ~df["hostname"].isin(rv_hosts)]
-    return missing.drop_duplicates(subset=["hostname", "bibcode"])
+    return unresolved_provenance_refs(df)
 
 
 def search_ads_instruments(vizier_results_csv, output_csv=None, cache_path="cache/ads_abstract_cache.json",
                             token=None, sleep=0.2, verbose=False):
-    """Run the two-tier ADS/ar5iv RV-instrument search and return the
+    """Run the three-tier ADS/ar5iv/ADS-fulltext RV-instrument search and return the
     results as a DataFrame. This is the importable entry point
     (main() is just a thin CLI wrapper around this, installed as the
     `rv-ads-search` command).
@@ -179,16 +254,39 @@ def search_ads_instruments(vizier_results_csv, output_csv=None, cache_path="cach
                 if verbose:
                     print(f"  no abstract match -- fetching ar5iv full text for arXiv:{arxiv_id}")
                 fulltext = fetch_ar5iv_fulltext(arxiv_id, session)
-                entry["fulltext_clues"] = find_rv_clues(fulltext)
-                cache_path.write_text(json.dumps(cache, indent=1))
+                # Only cache a real "read the text, found nothing" result.
+                # fulltext is None both on a fetch error and on a LaTeXML
+                # conversion failure (see fetch_ar5iv_fulltext) -- caching
+                # that as a confirmed-empty result would permanently hide
+                # a paper we never actually got to read.
+                if fulltext is not None:
+                    entry["fulltext_clues"] = find_rv_clues(fulltext)
+                    cache_path.write_text(json.dumps(cache, indent=1))
                 time.sleep(sleep)
-            if has_any_clue(entry["fulltext_clues"]):
+            if "fulltext_clues" in entry and has_any_clue(entry["fulltext_clues"]):
                 clues = entry["fulltext_clues"]
                 tier = "fulltext"
-            else:
-                tier = "fulltext (no clue found)" if arxiv_id else tier
-        elif not has_any_clue(clues):
-            tier = "none (no arXiv id resolvable)"
+
+        # Tier 3: ADS's own full-text index. Tried whenever tiers 1-2 found
+        # nothing -- including when there's no arXiv id to even attempt
+        # tier 2, or when ar5iv failed to render the paper (common for
+        # Nature-formatted LaTeX) -- since ADS indexes full text
+        # independent of arXiv's HTML conversion pipeline.
+        if not has_any_clue(clues):
+            if "ads_fulltext_clues" not in entry:
+                if verbose:
+                    print(f"  no clue from abstract/ar5iv -- trying ADS's own full-text index")
+                ads_clues = fetch_ads_fulltext_clues(bibcode, token, session)
+                if ads_clues is not None:
+                    entry["ads_fulltext_clues"] = ads_clues
+                    cache_path.write_text(json.dumps(cache, indent=1))
+                time.sleep(sleep)
+            if "ads_fulltext_clues" in entry and has_any_clue(entry["ads_fulltext_clues"]):
+                clues = entry["ads_fulltext_clues"]
+                tier = "ADS fulltext"
+
+        if not has_any_clue(clues):
+            tier = "none (checked abstract/ar5iv/ADS fulltext)"
 
         rows.append({
             "hostname": r["hostname"], "bibcode": bibcode, "display": r["display"],

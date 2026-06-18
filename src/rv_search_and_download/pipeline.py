@@ -62,6 +62,7 @@ def run_pipeline(
     host=None,
     output_dir=".",
     vizier_cache="cache/vizier_bibcode_cache.json",
+    vizier_readme_cache="cache/vizier_readme_cache.json",
     ads_cache="cache/ads_abstract_cache.json",
     ads_token=None,
     downloaded_tables_dir="downloaded_rv_tables",
@@ -90,6 +91,11 @@ def run_pipeline(
         Paths to the JSON bibcode caches stage 1 and stage 2 maintain.
         Shared/reused across runs and across different `planet_catalog`
         files, since a bibcode means the same paper everywhere.
+    vizier_readme_cache : str
+        Path to the JSON cache of catalog -> {table_stem: has_rv_column},
+        parsed from each catalog's CDS ReadMe. Stage 1 uses this to confirm
+        that a table whose title/description merely mentions "RV" actually
+        has an RV column, instead of trusting the keyword match alone.
     ads_token : str or None
         ADS API token (free from https://ui.adsabs.harvard.edu/user/settings/token).
         If None, falls back to the $ADS_API_TOKEN environment variable
@@ -131,15 +137,18 @@ def run_pipeline(
         host=host,
         sleep=vizier_sleep,
         verbose=verbose,
+        readme_cache_path=vizier_readme_cache,
     )
 
-    # --- Stage 2: only needed if some Msini host still has no VizieR table ---
+    # --- Stage 2: only needed if some provenance reference still has no VizieR table ---
     # (search_ads_instruments reads vizier_output_csv itself and figures out
     # which hosts/references still need a lookup, so we just check here
-    # whether that set is empty to decide whether to skip the stage.)
-    rv_hosts = set(vizier_results.loc[vizier_results["looks_like_rv"], "hostname"])
-    msini_hosts = set(vizier_results.loc[vizier_results["rv_provenance"], "hostname"])
-    still_missing = msini_hosts - rv_hosts
+    # whether that set is empty to decide whether to skip the stage. This is
+    # checked per (hostname, bibcode), not per hostname: a host can cite many
+    # papers, and a *different*, non-provenance reference having an RV table
+    # on VizieR doesn't mean the paper actually credited with the reported
+    # mass does too -- see vizier_search.unresolved_provenance_refs.)
+    still_missing = set(vizier_search.unresolved_provenance_refs(vizier_results)["hostname"])
 
     ads_results = None
     if still_missing:
@@ -197,6 +206,7 @@ def main():
     parser.add_argument("--downloaded-tables-dir", default="downloaded_rv_tables",
                          help="Where to write the final downloaded RV table CSVs")
     parser.add_argument("--vizier-cache", default="cache/vizier_bibcode_cache.json")
+    parser.add_argument("--vizier-readme-cache", default="cache/vizier_readme_cache.json")
     parser.add_argument("--ads-cache", default="cache/ads_abstract_cache.json")
     parser.add_argument("--ads-token", default=None,
                          help="ADS API token; defaults to the $ADS_API_TOKEN environment variable")
@@ -211,6 +221,7 @@ def main():
         host=args.host,
         output_dir=args.output_dir,
         vizier_cache=args.vizier_cache,
+        vizier_readme_cache=args.vizier_readme_cache,
         ads_cache=args.ads_cache,
         ads_token=args.ads_token,
         downloaded_tables_dir=args.downloaded_tables_dir,
