@@ -79,16 +79,31 @@ export ADS_API_TOKEN=your_token_here
 ## Quick start
 
 A tiny 3-system sample (`sample_data/sample_data.csv`) is bundled so you
-can try the pipeline immediately -- it deliberately covers all three
-outcomes: a direct VizieR hit (K2-138), a DACE redirect (HD 20781), and an
-unresolved case (tau Cet, whose RV paper isn't on VizieR or arXiv).
+can try the pipeline immediately -- it covers three different resolution
+paths:
+
+- **K2-138**: direct VizieR hit (Lopez et al. 2019, J/A+A/631/A90,
+  194 rows) plus an independent DACE dataset (215 rows).
+- **HD 20781**: no VizieR table; stage 2 finds CORALIE and HARPS named in
+  the Udry et al. 2019 abstract (both are DACE-pipeline instruments), so
+  stage 3 queries DACE directly (240 rows).
+- **tau Cet**: no VizieR table; stage 2 finds HARPS in the Feng et al.
+  2017 abstract, triggering a DACE query (20,202 rows -- tau Cet has
+  extensive multi-decade HARPS coverage in the archive).
 
 ```bash
 rv-search-and-download --catalog sample_data/sample_data.csv
 ```
 
-Expected: 2 of the 3 hosts get a downloaded RV table; tau Cet is reported
-as unresolved (with the implicated reference named, for manual follow-up).
+Expected: all 3 hosts get at least one downloaded RV table (3/3).
+
+You will see a harmless warning at startup about a missing `.dacerc` file
+-- that file is only needed for authenticated/private DACE access; public
+queries (which is all this pipeline does) work without it.
+
+The `cache/` directory is populated on first run; subsequent runs against
+the same or an overlapping catalog skip live network queries for any
+bibcode already resolved.
 
 ### Running on your own data
 
