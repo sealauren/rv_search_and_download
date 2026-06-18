@@ -41,8 +41,9 @@ For every host star in the input table, this pipeline:
    - A live query to the public DACE archive. DACE is attempted for
      **every** Msini host -- not just those where stage 2 named DACE
      explicitly -- because its public API is a plain target-name lookup
-     that needs no textual clue, and an independent dataset there is
-     valuable even when another source already exists.
+     that needs no textual clue, and an aggregated dataset there is
+     valuable even when another source already exists, even if there
+     are some duplicate RVs.
 
    Each downloaded file is saved to `downloaded_rv_tables/<host>/` with
    a commented header describing the source and every column's
