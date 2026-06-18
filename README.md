@@ -6,17 +6,47 @@ velocity (RV) data behind each target star's planet masses.
 For every host star in the input table, this pipeline:
 
 1. **Searches VizieR** for an RV table associated with any paper the NEA
-   cites for that system (matched by ADS bibcode).
-2. **Falls back to ADS/arXiv** when a star has a literature Msini mass (proof
-   an RV orbit was fit somewhere) but no VizieR table turned up -- reading
-   the paper's abstract, and if needed its arXiv full text, to identify which
-   spectrograph or archive (e.g. DACE, the California Legacy Survey) was
-   actually used.
-3. **Downloads the resolved data** -- a VizieR table, a redirect to the
-   California Legacy Survey's table in Rosenthal et al. (2021), or a live
-   query to the public DACE archive -- and saves it to
-   `downloaded_rv_tables/<host>/`, with a commented header describing the
-   source and every column's name/unit/meaning.
+   cites for that system (matched by ADS bibcode). A candidate table must
+   (a) belong to a journal-published catalog (`J/` class, not VizieR's own
+   homogeneous survey catalogs like Gaia), (b) have a title or description
+   matching RV keywords, and (c) actually contain an RV column -- verified
+   by parsing the catalog's CDS ReadMe byte-by-byte column definitions,
+   not just trusting the keyword match alone. Tables that textually
+   identify as belonging to a *different* host in a shared multi-target
+   catalog are also filtered out.
+
+2. **Falls back to a three-tier ADS/arXiv search** for hosts that have a
+   literature Msini mass (proof an RV orbit was fit somewhere) but whose
+   provenance reference has no VizieR table:
+   - **Tier 1**: the paper's ADS abstract.
+   - **Tier 2**: if tier 1 finds nothing and the paper has an arXiv id,
+     the full text via [ar5iv.org](https://ar5iv.labs.arxiv.org/) (LaTeXML
+     HTML rendering, no PDF parsing needed).
+   - **Tier 3**: if tiers 1--2 still find nothing -- including when there's
+     no arXiv id, or ar5iv failed to render the paper -- ADS's own
+     full-text search index, which is built from the publisher and isn't
+     subject to arXiv/LaTeXML rendering failures.
+
+   Each tier looks for named RV instruments/surveys (HARPS, HIRES, etc.),
+   and two special-case redirects: a California Legacy Survey mention
+   (the data lives in Rosenthal et al. 2021, not the citing paper) and a
+   DACE mention or DACE-pipeline spectrograph name (ESPRESSO, HARPS,
+   HARPS-N, CORALIE, CARMENES, SOPHIE).
+
+3. **Downloads the resolved data** for every host with a reported Msini
+   mass:
+   - A direct VizieR table hit from stage 1.
+   - Rosenthal et al. 2021's CLS table (J/ApJS/255/8/table6), filtered
+     to this host's rows, when a CLS redirect was found in stage 2.
+   - A live query to the public DACE archive. DACE is attempted for
+     **every** Msini host -- not just those where stage 2 named DACE
+     explicitly -- because its public API is a plain target-name lookup
+     that needs no textual clue, and an independent dataset there is
+     valuable even when another source already exists.
+
+   Each downloaded file is saved to `downloaded_rv_tables/<host>/` with
+   a commented header describing the source and every column's
+   name/unit/meaning.
 
 ## Why
 
@@ -110,34 +140,38 @@ rv_search_and_download/
 
 | Stage | Module | Standalone command | What it does |
 |---|---|---|---|
-| 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables whose title/catalog looks like a genuine per-target RV dataset (excluding VizieR's big homogeneous survey catalogs like Gaia, which aren't precision differential RVs). |
-| 2 | `ads_search.py` | `rv-ads-search` | For hosts with an Msini-derived mass but no VizieR hit: checks the cited paper's ADS abstract, then (if needed) its arXiv full text via [ar5iv.org](https://ar5iv.labs.arxiv.org/), for a named RV instrument/survey, or a CLS/DACE mention. |
-| 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source (VizieR table / Rosenthal+2021 CLS table / DACE target) and downloads it. |
+| 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables that (a) are from a journal-published catalog (`J/` class), (b) match RV keywords in the title/description, and (c) have an actual RV column per the catalog's CDS ReadMe. Tables that positively name a different host (shared multi-target catalogs) are excluded. Writes `vizier_rv_results.csv`. |
+| 2 | `ads_search.py` | `rv-ads-search` | For hosts with an Msini-derived mass but no VizieR hit: searches the cited paper's ADS abstract (tier 1), then its arXiv full text via ar5iv.org if available (tier 2), then ADS's own full-text index (tier 3), for a named RV instrument/survey or a CLS/DACE mention. Writes `ads_rv_instruments.csv`. Skipped entirely if stage 1 already resolved every Msini host. |
+| 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source(s) and downloads: direct VizieR table hits, the Rosenthal+2021 CLS table (filtered per host), and DACE (queried for every Msini host regardless of whether stage 2 found an explicit DACE clue). |
 
 Each stage caches its lookups by ADS bibcode under `cache/`
-(`cache/vizier_bibcode_cache.json`, `cache/ads_abstract_cache.json`), so
-reruns -- even against a different input catalog -- never re-query a paper
-you've already resolved.
+(`cache/vizier_bibcode_cache.json`, `cache/vizier_readme_cache.json`,
+`cache/ads_abstract_cache.json`), so reruns -- even against a different
+input catalog -- never re-query a paper you've already resolved.
 
-Each of the three modules above also works standalone via its own command
+Each of the three modules also works standalone via its own command
 (see the table); `rv-search-and-download` just chains them together. See
 the docstring at the top of each file (under `src/rv_search_and_download/`)
 for its own `--flags`.
 
 ## Known limitations
 
-- The "looks like RV" check is a keyword heuristic on VizieR table titles
-  (`radial velocity`, `RV`, `spectroscopic orbit`), not a guarantee the
-  table is the *exact* dataset behind a given mass measurement.
-- ar5iv's LaTeXML full-text rendering occasionally fails for non-standard
-  journal templates (Nature-family papers in particular render as
-  near-empty stub pages) -- those papers fall back to "unresolved" even
-  though they're real arXiv preprints.
+- The VizieR RV check is a two-step heuristic (keyword match on table
+  title/description, then ReadMe column verification) and isn't a guarantee
+  the table is the *exact* dataset behind a given mass measurement.
+- The CDS ReadMe parser covers the common `J/` journal-catalog format; a
+  ReadMe that can't be fetched or doesn't parse falls back to the title
+  keyword match alone (noted in the output).
+- The Rosenthal+2021 CLS filtering matches HD/GJ/HIP host names to the
+  CPS identifier column; hosts with other designations (BD numbers, Giclas,
+  lettered multiples) can't be isolated and are skipped rather than
+  returning the whole-survey table.
 - DACE and VizieR are queried in public/anonymous mode; private or
   not-yet-public datasets won't be found.
-- Hosts where only a bare instrument name is found (no VizieR table, no
-  CLS/DACE mention) aren't auto-downloaded -- there's no machine-readable
-  location to fetch from without a manual archive lookup.
+- Hosts where only a bare, non-DACE instrument name was found (no VizieR
+  table, no CLS/DACE, and DACE returned no data) are reported as unresolved
+  -- there's no machine-readable location to fetch from without a manual
+  archive lookup.
 
 ## License
 
