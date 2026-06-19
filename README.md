@@ -280,12 +280,18 @@ local` (or `--init-config global`) to write a starter file to edit.
   description, e.g. "Instr [-] - [1,2] Instrument (1: ELODIE, 2:
   CORALIE)") are read directly; a small hardcoded map translates a few
   telescope names to their one RV spectrograph (e.g. "HET" -> "HRS")
-  when a table names the telescope rather than the instrument. Tables
-  with neither fall back to a best-effort keyword match against known
-  spectrograph names in the title/column descriptions, and a per-table
-  placeholder label when that also fails -- which means some VizieR/DACE
-  pairs using the same underlying instrument still won't be recognized
-  as possible duplicates.
+  when a table names the telescope rather than the instrument, and a
+  separate hardcoded map (`aggregate.KNOWN_INSTRUMENT_CODE_LEGENDS`)
+  covers a couple of specific tables whose code legend is documented only
+  in the catalog's external CDS ReadMe footnote rather than inline in the
+  column's own description (currently just Rosenthal et al. 2021's CLS
+  table6, whose "Inst" codes -- k/j/apf/lick -- map to
+  HIRES-PRE04/HIRES-POST04/APF/HAMILTON). Tables with none of the above
+  fall back to a best-effort keyword match against known spectrograph
+  names in the title/column descriptions, and a per-table placeholder
+  label when that also fails -- which means some VizieR/DACE pairs using
+  the same underlying instrument still won't be recognized as possible
+  duplicates.
 
 ## License
 
