@@ -82,7 +82,7 @@ ERROR_DESC_RE = re.compile(r'uncertain|error|sigma', re.IGNORECASE)
 # in the column's own description (e.g. "Instr [-] - [1,2] Instrument (1:
 # ELODIE, 2: CORALIE)"). Recognizing these gives duplicate detection a real
 # per-row instrument instead of one fallback label for the whole table.
-INSTRUMENT_COLUMN_NAME_RE = re.compile(r'^(tel|telescope|instr|instrument|spectro|spectrograph|facility)$', re.IGNORECASE)
+INSTRUMENT_COLUMN_NAME_RE = re.compile(r'^(tel|telescope|inst|instr|instrument|spectro|spectrograph|facility)$', re.IGNORECASE)
 INSTRUMENT_LEGEND_RE = re.compile(r'\((?:\s*\d+\s*:\s*[^,()]+,?\s*)+\)')
 LEGEND_CODE_PAIR_RE = re.compile(r'(\d+)\s*:\s*([^,()]+)')
 
@@ -94,6 +94,22 @@ LEGEND_CODE_PAIR_RE = re.compile(r'(\d+)\s*:\s*([^,()]+)')
 # telescope label.
 TELESCOPE_TO_INSTRUMENT = {
     "HET": "HRS",
+}
+
+# A handful of VizieR tables' per-row instrument-code column has its legend
+# documented only in the catalog's external CDS ReadMe footnote ("Note (1):
+# ..."), not inline in the column's own description the way
+# parse_instrument_legend expects (e.g. Rosenthal et al. 2021's CLS table6
+# just says "Inst [-] - Instrument code (1)"). Hardcoded per known table id
+# (download.py's sanitized table_id, i.e. the downloaded file's stem) since
+# there's nothing in the saved file's header to parse this from generically.
+KNOWN_INSTRUMENT_CODE_LEGENDS = {
+    # https://cdsarc.cds.unistra.fr/ftp/J/ApJS/255/8/ReadMe, Note (1) under
+    # table6.dat. Codes cross-checked against DACE's own labels for the same
+    # underlying CPS/HIRES program (folder names "HIRES_pre2004"/
+    # "HIRES_post2004") by confirming overlapping timestamps between this
+    # table's "j" rows and DACE's "HIRES-POST04" rows for the same host.
+    "J_ApJS_255_8_table6": {"k": "HIRES-PRE04", "j": "HIRES-POST04", "apf": "APF", "lick": "HAMILTON"},
 }
 
 
@@ -251,6 +267,7 @@ def load_vizier_table(path, columns):
         return None, "could not identify time/RV columns from this table's header metadata"
 
     instr_col, legend = find_instrument_row_source(columns)
+    legend = legend or KNOWN_INSTRUMENT_CODE_LEGENDS.get(path.stem)
     if instr_col and instr_col in df.columns:
         raw = df[instr_col].astype(str).str.strip()
         if legend:
