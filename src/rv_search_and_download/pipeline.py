@@ -2,7 +2,7 @@
 rv_search_and_download.pipeline
 ================================
 
-One-call wrapper around the three-stage RV-table pipeline:
+One-call wrapper around the four-stage RV-table pipeline:
 
   1. vizier_search -- for each target star ("host"), aggregate every
                        literature reference the NASA Exoplanet Archive
@@ -22,6 +22,13 @@ One-call wrapper around the three-stage RV-table pipeline:
                        downloaded_rv_tables/<host>/, with a commented
                        header describing where the data came from and
                        what each column means.
+  4. aggregate      -- combine every downloaded table for a host into one
+                       analysis-ready file: standardized BJD/RV(m/s)/RV
+                       error(m/s) columns, per-table systemic RV offsets
+                       removed, and likely-duplicate RVs (same host,
+                       instrument, and timestamp across different tables)
+                       flagged for review. Written to
+                       aggregated_rv_tables/<host>_rvs_aggregated.csv.
 
 Each stage writes (and re-reads) a small JSON cache keyed by ADS bibcode, so
 re-running this on overlapping target lists -- or on a much bigger catalog
@@ -54,7 +61,7 @@ from pathlib import Path
 # standalone -- see the docstring at the top of each file. Importing them
 # here just lets us call their logic directly instead of shelling out to
 # separate processes.
-from . import vizier_search, ads_search, download
+from . import vizier_search, ads_search, download, aggregate
 
 
 def run_pipeline(
@@ -66,12 +73,13 @@ def run_pipeline(
     ads_cache="cache/ads_abstract_cache.json",
     ads_token=None,
     downloaded_tables_dir="downloaded_rv_tables",
+    aggregated_tables_dir="aggregated_rv_tables",
     vizier_sleep=1.0,
     ads_sleep=0.2,
     download_sleep=0.5,
     verbose=False,
 ):
-    """Run all three pipeline stages back-to-back for one or more target stars.
+    """Run all four pipeline stages back-to-back for one or more target stars.
 
     Parameters
     ----------
@@ -102,6 +110,8 @@ def run_pipeline(
         (see ads_search.load_token).
     downloaded_tables_dir : str
         Where the final per-host RV data CSVs get written.
+    aggregated_tables_dir : str
+        Where stage 4's per-host analysis-ready RV CSVs get written.
     vizier_sleep, ads_sleep, download_sleep : float
         Seconds to pause between live requests to VizieR / ADS+ar5iv / VizieR+DACE
         respectively, to stay polite to those services.
@@ -120,6 +130,9 @@ def run_pipeline(
                                   skipped in that case).
         "downloaded_sources"  -- {hostname: [source dict, ...]} actually
                                   downloaded in stage 3.
+        "aggregated_rvs"      -- {hostname: path} to stage 4's analysis-ready
+                                  CSV, for every host that got at least one
+                                  downloaded table.
         "unresolved_hosts"    -- hosts with a reported Msini planet but no
                                   downloadable RV source found by any stage.
     """
@@ -129,7 +142,7 @@ def run_pipeline(
     ads_output_csv = output_dir / "ads_rv_instruments.csv"
 
     # --- Stage 1: search VizieR directly for each host's references ---
-    print("=== Stage 1/3: searching VizieR for RV tables ===")
+    print("=== Stage 1/4: searching VizieR for RV tables ===")
     vizier_results = vizier_search.search_vizier(
         input_csv=planet_catalog,
         output_csv=vizier_output_csv,
@@ -152,7 +165,7 @@ def run_pipeline(
 
     ads_results = None
     if still_missing:
-        print(f"\n=== Stage 2/3: {len(still_missing)} host(s) need an ADS/arXiv instrument lookup ===")
+        print(f"\n=== Stage 2/4: {len(still_missing)} host(s) need an ADS/arXiv instrument lookup ===")
         ads_results = ads_search.search_ads_instruments(
             vizier_results_csv=vizier_output_csv,
             output_csv=ads_output_csv,
@@ -162,10 +175,10 @@ def run_pipeline(
             verbose=verbose,
         )
     else:
-        print("\n=== Stage 2/3: skipped (every Msini host already has a VizieR RV table) ===")
+        print("\n=== Stage 2/4: skipped (every Msini host already has a VizieR RV table) ===")
 
     # --- Stage 3: download whatever concrete RV source(s) stages 1-2 found ---
-    print("\n=== Stage 3/3: downloading resolved RV tables ===")
+    print("\n=== Stage 3/4: downloading resolved RV tables ===")
     if ads_results is None:
         # No stage-2 output exists yet (it was skipped), but download.download_tables
         # still needs *an* ads CSV to read -- write an empty placeholder with
@@ -185,10 +198,19 @@ def run_pipeline(
         sleep=download_sleep,
     )
 
+    # --- Stage 4: combine each host's downloaded table(s) into one analysis-ready file ---
+    print("\n=== Stage 4/4: aggregating downloaded RV tables for analysis ===")
+    aggregated_rvs = aggregate.aggregate_all(
+        downloaded_dir=downloaded_tables_dir,
+        out_dir=aggregated_tables_dir,
+        host=host,
+    )
+
     return {
         "vizier_results": vizier_results,
         "ads_instruments": ads_results,
         "downloaded_sources": downloaded_sources,
+        "aggregated_rvs": aggregated_rvs,
         "unresolved_hosts": unresolved_hosts,
     }
 
@@ -205,6 +227,8 @@ def main():
     parser.add_argument("--output-dir", default=".", help="Where to write the intermediate results CSVs")
     parser.add_argument("--downloaded-tables-dir", default="downloaded_rv_tables",
                          help="Where to write the final downloaded RV table CSVs")
+    parser.add_argument("--aggregated-tables-dir", default="aggregated_rv_tables",
+                         help="Where to write the per-host analysis-ready aggregated RV CSVs")
     parser.add_argument("--vizier-cache", default="cache/vizier_bibcode_cache.json")
     parser.add_argument("--vizier-readme-cache", default="cache/vizier_readme_cache.json")
     parser.add_argument("--ads-cache", default="cache/ads_abstract_cache.json")
@@ -225,6 +249,7 @@ def main():
         ads_cache=args.ads_cache,
         ads_token=args.ads_token,
         downloaded_tables_dir=args.downloaded_tables_dir,
+        aggregated_tables_dir=args.aggregated_tables_dir,
         vizier_sleep=args.vizier_sleep,
         ads_sleep=args.ads_sleep,
         download_sleep=args.download_sleep,
@@ -234,7 +259,9 @@ def main():
     # Final wrap-up message for the CLI user.
     n_hosts = result["vizier_results"]["hostname"].nunique()
     n_downloaded = len(result["downloaded_sources"])
-    print(f"\nDone. {n_downloaded}/{n_hosts} host(s) processed got at least one downloaded RV table.")
+    n_aggregated = len(result["aggregated_rvs"])
+    print(f"\nDone. {n_downloaded}/{n_hosts} host(s) processed got at least one downloaded RV table "
+          f"({n_aggregated} aggregated for analysis).")
     if result["unresolved_hosts"]:
         print(f"{len(result['unresolved_hosts'])} host(s) still have no downloadable RV source: "
               f"{', '.join(result['unresolved_hosts'])}")

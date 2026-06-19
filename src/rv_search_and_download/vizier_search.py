@@ -26,6 +26,16 @@ RV_KEYWORD_RE = re.compile(r'radial\s*veloc|spectroscopic\s*orbit|\bRVs?\b', re.
 # (Msini), as opposed to e.g. a mass-radius relationship or TTVs.
 MSINI_PROVENANCE = {"Msini", "Msin(i)/sin(i)"}
 
+# Always construct the results DataFrame with this fixed column set --
+# otherwise an empty `rows` list (e.g. every --host value failed to match
+# the catalog) produces a zero-column DataFrame, and the "looks_like_rv"
+# lookup just below crashes with a KeyError instead of reporting 0 results.
+RESULT_COLUMNS = [
+    "hostname", "refstr", "bibcode", "display", "href",
+    "vizier_catalog", "vizier_table", "table_title", "looks_like_rv",
+    "rv_provenance", "note",
+]
+
 VIZIER_URL = "https://vizier.cds.unistra.fr/viz-bin/VizieR-3"
 HEADERS = {"User-Agent": "vizier_rv_search.py (research script; contact lweiss4@nd.edu)"}
 
@@ -344,6 +354,10 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
     if host:
         hosts = [h.strip() for h in host.split(",")]
         df = df[df["hostname"].isin(hosts)]
+        unmatched = [h for h in hosts if h not in all_hostnames]
+        if unmatched:
+            print(f"  ! WARNING: host(s) not found in {input_csv} (check spelling/spacing -- "
+                  f"hostnames must match the catalog exactly): {', '.join(unmatched)}")
 
     host_refs = aggregate_references_by_host(df)
     cache_path = Path(cache_path)
@@ -441,10 +455,15 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
                     "rv_provenance": rv_provenance, "note": note,
                 })
 
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     if output_csv:
         out.to_csv(output_csv, index=False)
         print(f"wrote {len(out)} rows to {output_csv}")
+
+    if out.empty:
+        print("0/0 hosts have at least one candidate RV table on VizieR (no host matched the catalog -- "
+              "see the WARNING above, if any)")
+        return out
 
     rv_hosts = set(out.loc[out["looks_like_rv"], "hostname"].unique())
     print(f"{len(rv_hosts)}/{out['hostname'].nunique()} hosts have at least one candidate RV table on VizieR")

@@ -1,6 +1,7 @@
 # Generated outputs (re-creatable by running the pipeline)
 cache/
 downloaded_rv_tables/
+aggregated_rv_tables/
 vizier_rv_results.csv
 ads_rv_instruments.csv
 
