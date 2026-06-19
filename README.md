@@ -11,9 +11,12 @@ For every host star in the input table, this pipeline:
    homogeneous survey catalogs like Gaia), (b) have a title or description
    matching RV keywords, and (c) actually contain an RV column -- verified
    by parsing the catalog's CDS ReadMe byte-by-byte column definitions,
-   not just trusting the keyword match alone. Tables that textually
-   identify as belonging to a *different* host in a shared multi-target
-   catalog are also filtered out.
+   not just trusting the keyword match alone. Tables that belong to a
+   *different* host in a shared multi-target catalog are also filtered
+   out -- matched either by hostname text or, when a catalog splits data
+   across separate per-star tables titled with a bare HD/HIP number
+   instead of a common name, by the NEA's own `hd_name`/`hip_name`
+   designations for each host.
 
 2. **Falls back to a three-tier ADS/arXiv search** for hosts that have a
    literature Msini mass (proof an RV orbit was fit somewhere) but whose
@@ -35,7 +38,13 @@ For every host star in the input table, this pipeline:
 
 3. **Downloads the resolved data** for every host with a reported Msini
    mass:
-   - A direct VizieR table hit from stage 1.
+   - A direct VizieR table hit from stage 1. If the fetched table
+     turns out to combine RV data for several different stars in one
+     table (a per-row `Name`/`Star`/`Target`/`Object`/`Source` column
+     with more than one distinct value -- common in older survey
+     papers), it's filtered down to this host's rows by matching that
+     column against the host's name and HD/HIP designations before
+     saving, rather than saving every star's RVs under this one host.
    - Rosenthal et al. 2021's CLS table (J/ApJS/255/8/table6), filtered
      to this host's rows, when a CLS redirect was found in stage 2.
    - A live query to the public DACE archive. DACE is attempted for
@@ -48,6 +57,16 @@ For every host star in the input table, this pipeline:
    Each downloaded file is saved to `downloaded_rv_tables/<host>/` with
    a commented header describing the source and every column's
    name/unit/meaning.
+
+4. **Aggregates each host's downloaded table(s)** into a single
+   analysis-ready file: standardizes time/RV/RV-error into BJD, RV (m/s),
+   and RV error (m/s); median-subtracts the RV column within each
+   (table, instrument) group to remove pipeline-to-pipeline systemic
+   offsets; and flags likely-duplicate RVs (same host and instrument,
+   timestamps from different tables within 10 seconds of each other) for
+   review, picking a default "preferred" row per a configurable policy.
+   Written to `aggregated_rv_tables/<host>_rvs_aggregated.csv` -- this is
+   the file meant to be fed straight into RV-fitting tools like `radvel`.
 
 ## Why
 
@@ -63,10 +82,10 @@ per target.
 pip install -e .
 ```
 
-This installs the package in editable mode and adds four commands to your
+This installs the package in editable mode and adds five commands to your
 shell: `rv-search-and-download` (the full pipeline) and `rv-vizier-search`,
-`rv-ads-search`, `rv-download-tables` for running any single stage on its
-own.
+`rv-ads-search`, `rv-download-tables`, `rv-aggregate-rvs` for running any
+single stage on its own.
 
 Get a free ADS API token from your [ADS account settings](https://ui.adsabs.harvard.edu/user/settings/token)
 and export it -- needed for stage 2 (the VizieR-only stage 1 and DACE
@@ -95,7 +114,8 @@ paths:
 rv-search-and-download --catalog sample_data/sample_data.csv
 ```
 
-Expected: all 3 hosts get at least one downloaded RV table (3/3).
+Expected: all 3 hosts get at least one downloaded RV table (3/3), and a
+matching `aggregated_rv_tables/<host>_rvs_aggregated.csv` for each.
 
 You will see a harmless warning at startup about a missing `.dacerc` file
 -- that file is only needed for authenticated/private DACE access; public
@@ -133,6 +153,7 @@ result = run_pipeline(
 result["vizier_results"]      # DataFrame: one row per host/reference/matched-table
 result["ads_instruments"]     # DataFrame: ADS/arXiv lookups (None if stage 2 wasn't needed)
 result["downloaded_sources"]  # {hostname: [source dict, ...]} actually downloaded
+result["aggregated_rvs"]      # {hostname: path} to each host's analysis-ready aggregated CSV
 result["unresolved_hosts"]    # hosts with a reported Msini but no downloadable source
 ```
 
@@ -145,30 +166,62 @@ rv_search_and_download/
 │   ├── vizier_search.py    # stage 1
 │   ├── ads_search.py       # stage 2
 │   ├── download.py         # stage 3
+│   ├── aggregate.py        # stage 4
 │   └── pipeline.py         # run_pipeline() + the rv-search-and-download CLI
 ├── sample_data/
 │   └── sample_data.csv     # tiny 3-system demo input
 ├── cache/                  # gitignored; bibcode -> lookup caches, created on first run
-└── downloaded_rv_tables/   # gitignored; final output, created on first run
+├── downloaded_rv_tables/   # gitignored; stage 3 output, created on first run
+├── aggregated_rv_tables/   # gitignored; stage 4 output, created on first run
+└── rv_aggregate_config.json  # optional; local override of stage 4's duplicate-resolution policy
 ```
 
 ## How it works
 
 | Stage | Module | Standalone command | What it does |
 |---|---|---|---|
-| 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables that (a) are from a journal-published catalog (`J/` class), (b) match RV keywords in the title/description, and (c) have an actual RV column per the catalog's CDS ReadMe. Tables that positively name a different host (shared multi-target catalogs) are excluded. Writes `vizier_rv_results.csv`. |
+| 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables that (a) are from a journal-published catalog (`J/` class), (b) match RV keywords in the title/description, and (c) have an actual RV column per the catalog's CDS ReadMe. Tables belonging to a different host in a shared multi-target catalog are excluded -- by hostname text match, or by HD/HIP designation when the table is titled with a bare catalog number. Writes `vizier_rv_results.csv`. |
 | 2 | `ads_search.py` | `rv-ads-search` | For hosts with an Msini-derived mass but no VizieR hit: searches the cited paper's ADS abstract (tier 1), then its arXiv full text via ar5iv.org if available (tier 2), then ADS's own full-text index (tier 3), for a named RV instrument/survey or a CLS/DACE mention. Writes `ads_rv_instruments.csv`. Skipped entirely if stage 1 already resolved every Msini host. |
-| 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source(s) and downloads: direct VizieR table hits, the Rosenthal+2021 CLS table (filtered per host), and DACE (queried for every Msini host regardless of whether stage 2 found an explicit DACE clue). |
+| 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source(s) and downloads: direct VizieR table hits (filtering out any rows belonging to other stars if the fetched table actually combines several stars' RVs), the Rosenthal+2021 CLS table (filtered per host), and DACE (queried for every Msini host regardless of whether stage 2 found an explicit DACE clue). |
+| 4 | `aggregate.py` | `rv-aggregate-rvs` | Reads every downloaded table for a host (using the commented header `download.py` already wrote -- no re-querying VizieR/DACE), standardizes time/RV/RV-error into BJD/m/s/m/s, median-subtracts RV within each (table, instrument) group, flags likely-duplicate RVs across tables, and writes `aggregated_rv_tables/<host>_rvs_aggregated.csv`. |
 
 Each stage caches its lookups by ADS bibcode under `cache/`
 (`cache/vizier_bibcode_cache.json`, `cache/vizier_readme_cache.json`,
 `cache/ads_abstract_cache.json`), so reruns -- even against a different
 input catalog -- never re-query a paper you've already resolved.
 
-Each of the three modules also works standalone via its own command
+Each of the four modules also works standalone via its own command
 (see the table); `rv-search-and-download` just chains them together. See
 the docstring at the top of each file (under `src/rv_search_and_download/`)
 for its own `--flags`.
+
+### Duplicate-RV resolution policy (stage 4)
+
+Stage 4 flags RVs from different downloaded tables as likely duplicates
+when they share a host and instrument and their timestamps are within 10
+seconds of each other (see `duplicate_group` in the output -- every row is
+kept for review, not silently dropped). Which row in a `duplicate_group`
+is marked `is_preferred` (the one to use for analysis) is controlled by a
+small JSON config:
+
+```json
+{
+  "duplicate_default": "prefer_source",
+  "preferred_source_order": ["dace", "vizier"]
+}
+```
+
+- `"duplicate_default": "prefer_source"` (the default) always prefers
+  whichever source appears earliest in `preferred_source_order`.
+- `"duplicate_default": "most_recent"` instead prefers whichever row's
+  publication is more recent (parsed from its ADS bibcode, or the
+  retrieval date as a fallback).
+
+Stage 4 looks for `rv_aggregate_config.json` in the current directory
+first (a per-project/per-directory override), then falls back to
+`~/.config/rv_search_and_download/config.json` (a global default), then
+its built-in defaults shown above. Run `rv-aggregate-rvs --init-config
+local` (or `--init-config global`) to write a starter file to edit.
 
 ## Known limitations
 
@@ -182,12 +235,31 @@ for its own `--flags`.
   CPS identifier column; hosts with other designations (BD numbers, Giclas,
   lettered multiples) can't be isolated and are skipped rather than
   returning the whole-survey table.
+- The generic multi-target table filter in stage 3 only recognizes a
+  per-row id column named `Name`, `Star`, `Target`, `Object`, or `Source`,
+  and only matches a host by its common name or HD/HIP designation; a
+  table that identifies stars some other way (a different column name, or
+  a different catalog like BD/Giclas) won't be detected as multi-target
+  and could still be saved unfiltered.
 - DACE and VizieR are queried in public/anonymous mode; private or
   not-yet-public datasets won't be found.
 - Hosts where only a bare, non-DACE instrument name was found (no VizieR
   table, no CLS/DACE, and DACE returned no data) are reported as unresolved
   -- there's no machine-readable location to fetch from without a manual
   archive lookup.
+- Stage 4's duplicate detection requires knowing each row's instrument.
+  DACE rows carry a real per-row instrument name. VizieR tables that
+  carry their own per-row telescope/instrument column (literal text like
+  a "Tel" column, or a numeric code explained in the column's own
+  description, e.g. "Instr [-] - [1,2] Instrument (1: ELODIE, 2:
+  CORALIE)") are read directly; a small hardcoded map translates a few
+  telescope names to their one RV spectrograph (e.g. "HET" -> "HRS")
+  when a table names the telescope rather than the instrument. Tables
+  with neither fall back to a best-effort keyword match against known
+  spectrograph names in the title/column descriptions, and a per-table
+  placeholder label when that also fails -- which means some VizieR/DACE
+  pairs using the same underlying instrument still won't be recognized
+  as possible duplicates.
 
 ## License
 
