@@ -57,6 +57,44 @@ HD_RE = re.compile(r'^HD\s*(\d+)', re.IGNORECASE)
 GJ_RE = re.compile(r'^G[JL]\s*(\d+)', re.IGNORECASE)
 HIP_RE = re.compile(r'^HIP\s*(\d+)', re.IGNORECASE)
 
+# Column names some VizieR RV tables use to identify which star each row
+# belongs to, for tables that -- like Rosenthal+2021's CLS table6 above --
+# combine many different targets' RVs into one table but (unlike table6)
+# weren't specifically anticipated here. Checked in download_vizier_table
+# whenever a fetched table isn't already known to need the CLS-specific
+# CPS-column filtering above.
+GENERIC_MULTI_TARGET_ID_COLUMNS = ["Name", "Star", "Target", "Object", "Source"]
+
+
+def normalize_identifier(value):
+    return re.sub(r'[^a-z0-9]', '', str(value).lower())
+
+
+def host_identifier_candidates(hostname, hd_name=None, hip_name=None):
+    """Normalized strings that might identify `hostname` in a VizieR
+    table's per-row star-name column: its own name, plus its HD/HIP
+    designations both with and without the catalog prefix (one survey's
+    table might list "47 UMa", another "HD 95128", another a bare
+    "95128") -- for filtering tables that combine many stars' RVs into
+    one table down to just this host's rows.
+    """
+    candidates = {normalize_identifier(hostname)}
+    for raw in (hd_name, hip_name):
+        if pd.notna(raw):
+            text = str(raw)
+            candidates.add(normalize_identifier(text))
+            m = re.search(r'(\d+)', text)
+            if m:
+                candidates.add(m.group(1).lstrip("0") or "0")
+    return candidates
+
+
+def detect_multi_target_column(colnames):
+    for c in GENERIC_MULTI_TARGET_ID_COLUMNS:
+        if c in colnames:
+            return c
+    return None
+
 
 def host_to_cps_id(hostname):
     """Best-effort guess at this host's identifier in Rosenthal et al.
@@ -108,6 +146,7 @@ def resolve_sources(vizier_csv, ads_csv):
         sources.setdefault(r["hostname"], []).append({
             "type": "vizier", "catalog": r["vizier_catalog"], "table_id": r["vizier_table"],
             "bibcode": r["bibcode"], "display": r["display"],
+            "hd_name": r.get("hd_name"), "hip_name": r.get("hip_name"),
         })
 
     for _, r in ads[ads["mentions_cls"] & ads["hostname"].isin(msini_hosts)].iterrows():
@@ -213,6 +252,31 @@ def download_vizier_table(hostname, source, out_dir):
             print(f"    ! could not isolate {hostname}'s rows in this multi-target table "
                   "(no reliable id match) -- skipping rather than saving every star's RVs under this host")
             return None
+    else:
+        # Not a table we already know needs row filtering (e.g. Rosenthal's
+        # CLS table6 above) -- but some other survey papers *also* publish
+        # one VizieR table covering many different stars (e.g. a per-row
+        # "Name" column listing several different HD numbers), and nothing
+        # upstream can know that without actually looking at the fetched
+        # data. Check here so those don't silently dump every star's RVs
+        # under this one host's directory.
+        id_col = detect_multi_target_column(table.colnames)
+        if id_col:
+            distinct = {str(v).strip() for v in table[id_col] if str(v).strip()}
+            if len(distinct) > 1:
+                n_total = len(table)
+                print(f"  ! WARNING: {source['table_id']} combines RV data for {len(distinct)} different "
+                      f"stars in one table, not just {hostname} ({n_total} rows total) -- "
+                      "filtering to this host's rows only")
+                candidates = host_identifier_candidates(hostname, source.get("hd_name"), source.get("hip_name"))
+                table = table[[normalize_identifier(v) in candidates for v in table[id_col]]]
+                if len(table) == 0:
+                    print(f"    ! could not isolate {hostname}'s rows in this multi-target table "
+                          f"(no value in column {id_col} matched this host's name/HD/HIP designation) -- "
+                          "skipping rather than saving every star's RVs under this host")
+                    return None
+                print(f"    kept {len(table)}/{n_total} rows matching {id_col}")
+                filter_note = f"Filtered from the full {n_total}-row table (column {id_col}) to this host's rows only"
 
     lines = [
         f"# Host: {hostname}",

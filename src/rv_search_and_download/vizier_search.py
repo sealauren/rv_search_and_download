@@ -33,7 +33,7 @@ MSINI_PROVENANCE = {"Msini", "Msin(i)/sin(i)"}
 RESULT_COLUMNS = [
     "hostname", "refstr", "bibcode", "display", "href",
     "vizier_catalog", "vizier_table", "table_title", "looks_like_rv",
-    "rv_provenance", "note",
+    "rv_provenance", "note", "hd_name", "hip_name",
 ]
 
 VIZIER_URL = "https://vizier.cds.unistra.fr/viz-bin/VizieR-3"
@@ -254,7 +254,51 @@ def normalize_host_slug(name):
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
 
-def table_belongs_to_other_host(table, hostname, other_hostnames):
+HD_NUM_RE = re.compile(r'\bHD\s*0*(\d+)\b', re.IGNORECASE)
+HIP_NUM_RE = re.compile(r'\bHIP\s*0*(\d+)\b', re.IGNORECASE)
+
+
+def extract_catalog_numbers(text):
+    """Pull out any HD/HIP catalog numbers mentioned in `text` (leading
+    zeros stripped), e.g. {"HD": {"95128"}, "HIP": set()} for "HD 095128"."""
+    text = text or ""
+    return {"HD": set(HD_NUM_RE.findall(text)), "HIP": set(HIP_NUM_RE.findall(text))}
+
+
+def build_host_designations(df):
+    """hostname -> {"HD": {...}, "HIP": {...}} parsed from the NEA catalog's
+    hd_name/hip_name columns. Many multi-target VizieR catalogs (e.g. an
+    ELODIE/HARPS survey paper covering a dozen unrelated stars) title each
+    per-target table with a bare HD/HIP number rather than the star's
+    common name -- "HD 95128" rather than "47 UMa" -- so a pure hostname
+    text match against the table title can't tell those tables apart.
+    """
+    designations = {}
+    for hostname, group in df.groupby("hostname"):
+        ids = {"HD": set(), "HIP": set()}
+        for col, key in (("hd_name", "HD"), ("hip_name", "HIP")):
+            if col in group.columns:
+                for raw in group[col].dropna().unique():
+                    ids[key] |= extract_catalog_numbers(str(raw))[key]
+        designations[hostname] = ids
+    return designations
+
+
+def host_primary_names(df):
+    """hostname -> (hd_name, hip_name) raw display strings (e.g. "HD 95128"),
+    propagated through to the download stage so it can filter VizieR
+    tables that combine many different stars' RVs into one table (see
+    download.detect_multi_target_column) -- not just the Rosenthal+2021
+    CLS table, which already had its own hardcoded filtering."""
+    names = {}
+    for hostname, group in df.groupby("hostname"):
+        hd = next(iter(group["hd_name"].dropna().unique()), None) if "hd_name" in group else None
+        hip = next(iter(group["hip_name"].dropna().unique()), None) if "hip_name" in group else None
+        names[hostname] = (hd, hip)
+    return names
+
+
+def table_belongs_to_other_host(table, hostname, other_hostnames, host_designations=None):
     """True if a table's id/title textually identifies it as belonging to
     a *different* host in `other_hostnames`, not `hostname`. Some VizieR
     catalogs cover multiple distinct targets in one paper, with separate
@@ -263,18 +307,35 @@ def table_belongs_to_other_host(table, hostname, other_hostnames):
     both happen to cite that paper) -- without this check, every table
     under a shared bibcode gets attached to every host citing it.
 
-    Returns False (not someone else's) whenever there's no textual hint
-    either way, so single-target catalogs -- the common case -- are
-    unaffected; this only fires when the table title/id positively names
-    a *different* known host.
+    Checks HD/HIP catalog numbers (via `host_designations`, see
+    build_host_designations) before falling back to a plain hostname text
+    match -- needed because some surveys title each per-target table with
+    a bare HD/HIP number (e.g. "HD 95128" for 47 UMa) that won't contain
+    either host's common name as a literal substring.
+
+    Returns False (not someone else's) whenever there's no hint either
+    way, so single-target catalogs -- the common case -- are unaffected;
+    this only fires when the table title/id positively names a
+    *different* known host.
     """
-    text = normalize_host_slug(f"{table['table_id']} {table['table_title']}")
+    raw_text = f"{table['table_id']} {table['table_title']}"
+    text = normalize_host_slug(raw_text)
     own_slug = normalize_host_slug(hostname)
+    host_designations = host_designations or {}
+
+    table_nums = extract_catalog_numbers(raw_text)
+    own_ids = host_designations.get(hostname, {"HD": set(), "HIP": set()})
+    if (table_nums["HD"] & own_ids["HD"]) or (table_nums["HIP"] & own_ids["HIP"]):
+        return False
     if own_slug and own_slug in text:
         return False
+
     for other in other_hostnames:
         if other == hostname:
             continue
+        other_ids = host_designations.get(other, {"HD": set(), "HIP": set()})
+        if (table_nums["HD"] & other_ids["HD"]) or (table_nums["HIP"] & other_ids["HIP"]):
+            return True
         other_slug = normalize_host_slug(other)
         # Skip very short slugs (e.g. "K2-3" -> "k23") -- too easy to
         # match by coincidence inside unrelated text.
@@ -347,10 +408,13 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
     """
     df = read_nea_csv(input_csv)
     # Used for table_belongs_to_other_host below -- the full catalog's
-    # hostnames, not just the (possibly --host-filtered) subset being
-    # processed, so a single-host run still benefits from knowing about
-    # other targets that might share a multi-target VizieR catalog.
+    # hostnames (and their HD/HIP designations), not just the (possibly
+    # --host-filtered) subset being processed, so a single-host run still
+    # benefits from knowing about other targets that might share a
+    # multi-target VizieR catalog.
     all_hostnames = set(df["hostname"].unique())
+    all_designations = build_host_designations(df)
+    all_names = host_primary_names(df)
     if host:
         hosts = [h.strip() for h in host.split(",")]
         df = df[df["hostname"].isin(hosts)]
@@ -369,6 +433,7 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
     rows = []
     failed_bibcodes = set()
     for hostname, refs in host_refs.items():
+        hd_name, hip_name = all_names.get(hostname, (None, None))
         for ref in refs:
             bibcode = ref["bibcode"]
             rv_provenance = ref.get("rv_provenance", False)
@@ -379,6 +444,7 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
                     "vizier_catalog": None, "vizier_table": None,
                     "table_title": None, "looks_like_rv": False,
                     "rv_provenance": rv_provenance, "note": "no ADS bibcode",
+                    "hd_name": hd_name, "hip_name": hip_name,
                 })
                 continue
 
@@ -418,6 +484,7 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
                     "table_title": None, "looks_like_rv": False,
                     "rv_provenance": rv_provenance,
                     "note": "VizieR query failed; will retry next run" if query_failed else "no VizieR catalog found",
+                    "hd_name": hd_name, "hip_name": hip_name,
                 })
             for t in tables:
                 rv_match = is_journal_table_catalog(t["catalog"]) and (
@@ -443,7 +510,7 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
                     elif not readme_tables[stem]:
                         rv_match = False
                         note = "ReadMe shows no RV column in this table; keyword match overridden"
-                if rv_match and table_belongs_to_other_host(t, hostname, all_hostnames):
+                if rv_match and table_belongs_to_other_host(t, hostname, all_hostnames, all_designations):
                     rv_match = False
                     note = "table id/title names a different host -- shared multi-target catalog, not this host's data"
                 rows.append({
@@ -453,6 +520,7 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
                     "table_title": t["table_title"],
                     "looks_like_rv": rv_match,
                     "rv_provenance": rv_provenance, "note": note,
+                    "hd_name": hd_name, "hip_name": hip_name,
                 })
 
     out = pd.DataFrame(rows, columns=RESULT_COLUMNS)
