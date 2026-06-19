@@ -248,13 +248,18 @@ local` (or `--init-config global`) to write a starter file to edit.
   -- there's no machine-readable location to fetch from without a manual
   archive lookup.
 - Stage 4's duplicate detection requires knowing each row's instrument.
-  DACE rows carry a real per-row instrument name, but most VizieR RV
-  tables don't have an instrument column at all; stage 4 falls back to a
-  best-effort keyword match against known spectrograph names, and a
-  per-table placeholder label when that fails -- which means a VizieR
-  table and a DACE table from the *same* underlying instrument (e.g. both
-  HARPS) won't always be recognized as overlapping, and won't be flagged
-  as possible duplicates even though they might be redundant.
+  DACE rows carry a real per-row instrument name. VizieR tables that
+  carry their own per-row telescope/instrument column (literal text like
+  a "Tel" column, or a numeric code explained in the column's own
+  description, e.g. "Instr [-] - [1,2] Instrument (1: ELODIE, 2:
+  CORALIE)") are read directly; a small hardcoded map translates a few
+  telescope names to their one RV spectrograph (e.g. "HET" -> "HRS")
+  when a table names the telescope rather than the instrument. Tables
+  with neither fall back to a best-effort keyword match against known
+  spectrograph names in the title/column descriptions, and a per-table
+  placeholder label when that also fails -- which means some VizieR/DACE
+  pairs using the same underlying instrument still won't be recognized
+  as possible duplicates.
 
 ## License
 

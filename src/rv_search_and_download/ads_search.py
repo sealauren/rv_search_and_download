@@ -59,7 +59,7 @@ RV_INSTRUMENTS = [
     "HARPS-N", "HARPS", "HIRES", "APF", "ESPRESSO", "CARMENES", "SOPHIE",
     "CORALIE", "PFS", "NEID", "MAROON-X", "EXPRES", "UVES", "FEROS", "TRES",
     "PARAS", "CHIRON", "ELODIE", "UCLES", "MINERVA", "SONG", "IRD", "GIANO",
-    "iSHELL", "AAPS", "LCES", "SPIRou", "ESPaDOnS",
+    "iSHELL", "AAPS", "LCES", "SPIRou", "ESPaDOnS", "HRS",
 ]
 INSTRUMENT_RE = re.compile(r"\b(" + "|".join(re.escape(i) for i in RV_INSTRUMENTS) + r")\b")
 ARCHIVAL_RE = re.compile(

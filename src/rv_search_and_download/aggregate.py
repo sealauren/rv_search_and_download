@@ -75,6 +75,60 @@ RV_ERR_NAME_RE = re.compile(r'^e_?rv$|rv_?err', re.IGNORECASE)
 RV_DESC_RE = re.compile(r'radial veloc', re.IGNORECASE)
 ERROR_DESC_RE = re.compile(r'uncertain|error|sigma', re.IGNORECASE)
 
+# Some VizieR RV tables -- unlike the typical title-only case
+# detect_vizier_instrument() handles -- do carry a per-row column naming
+# which telescope/instrument took each RV, either as literal text (e.g. a
+# "Tel" column with values like "HET") or as a numeric code explained right
+# in the column's own description (e.g. "Instr [-] - [1,2] Instrument (1:
+# ELODIE, 2: CORALIE)"). Recognizing these gives duplicate detection a real
+# per-row instrument instead of one fallback label for the whole table.
+INSTRUMENT_COLUMN_NAME_RE = re.compile(r'^(tel|telescope|instr|instrument|spectro|spectrograph|facility)$', re.IGNORECASE)
+INSTRUMENT_LEGEND_RE = re.compile(r'\((?:\s*\d+\s*:\s*[^,()]+,?\s*)+\)')
+LEGEND_CODE_PAIR_RE = re.compile(r'(\d+)\s*:\s*([^,()]+)')
+
+# A handful of VizieR tables identify the *telescope* rather than the
+# instrument/spectrograph that took each RV (e.g. Wittenmyer et al. 2009's
+# "Tel" column lists "HET", the Hobby-Eberly Telescope -- whose only RV
+# spectrograph at the time was HRS). Mapped here so those rows still get a
+# real, cross-source-matchable instrument name instead of the bare
+# telescope label.
+TELESCOPE_TO_INSTRUMENT = {
+    "HET": "HRS",
+}
+
+
+def parse_instrument_legend(desc):
+    """Parse a column description like '[1,2] Instrument (1: ELODIE, 2:
+    CORALIE)' into {'1': 'ELODIE', '2': 'CORALIE'}, or None if the
+    description isn't an instrument/telescope code legend."""
+    if not re.search(r'instrument|spectrograph|telescope', desc, re.IGNORECASE):
+        return None
+    m = INSTRUMENT_LEGEND_RE.search(desc)
+    if not m:
+        return None
+    pairs = LEGEND_CODE_PAIR_RE.findall(m.group(0))
+    return {code: label.strip() for code, label in pairs} if pairs else None
+
+
+def find_instrument_row_source(columns):
+    """Look for a per-row column identifying which telescope/instrument
+    took each RV. Returns (column_name, legend_or_None), or (None, None)
+    if no such column is named in the table's header metadata."""
+    for name, info in columns.items():
+        if INSTRUMENT_COLUMN_NAME_RE.match(name):
+            return name, parse_instrument_legend(info["desc"])
+    return None, None
+
+
+def normalize_instrument_label(raw):
+    raw = str(raw).strip()
+    if raw in TELESCOPE_TO_INSTRUMENT:
+        return TELESCOPE_TO_INSTRUMENT[raw]
+    for inst in RV_INSTRUMENTS:
+        if raw.lower() == inst.lower():
+            return inst
+    return raw
+
 
 def load_config(start_dir="."):
     """Load duplicate-resolution settings: a local rv_aggregate_config.json
@@ -196,12 +250,21 @@ def load_vizier_table(path, columns):
     if not time_col or not rv_col or time_col not in df.columns or rv_col not in df.columns:
         return None, "could not identify time/RV columns from this table's header metadata"
 
+    instr_col, legend = find_instrument_row_source(columns)
+    if instr_col and instr_col in df.columns:
+        raw = df[instr_col].astype(str).str.strip()
+        if legend:
+            raw = raw.map(lambda v: legend.get(v, v))
+        instrument = raw.map(normalize_instrument_label)
+    else:
+        instrument = detect_vizier_instrument(columns, path.stem)
+
     out = pd.DataFrame({
         "time_bjd": df[time_col].astype(float) + offset,
         "rv_raw_mps": df[rv_col].astype(float) * unit_to_mps_factor(columns[rv_col]["unit"]),
         "rv_err_mps": (df[err_col].astype(float) * unit_to_mps_factor(columns[err_col]["unit"])
                        if err_col and err_col in df.columns else float("nan")),
-        "instrument": detect_vizier_instrument(columns, path.stem),
+        "instrument": instrument,
     })
     extras = df.drop(columns=[c for c in (time_col, rv_col, err_col) if c], errors="ignore")
     return pd.concat([out, extras.reset_index(drop=True)], axis=1), None
