@@ -39,6 +39,7 @@ import pandas as pd
 from astroquery.vizier import Vizier
 from dace_query.spectroscopy import Spectroscopy
 
+from . import aliases
 from .ads_search import DACE_PIPELINE_INSTRUMENTS
 
 ROSENTHAL_BIBCODE = "2021ApJS..255....8R"
@@ -62,31 +63,72 @@ HIP_RE = re.compile(r'^HIP\s*(\d+)', re.IGNORECASE)
 # combine many different targets' RVs into one table but (unlike table6)
 # weren't specifically anticipated here. Checked in download_vizier_table
 # whenever a fetched table isn't already known to need the CLS-specific
-# CPS-column filtering above.
-GENERIC_MULTI_TARGET_ID_COLUMNS = ["Name", "Star", "Target", "Object", "Source"]
+# CPS-column filtering above. "Syst"/"System" covers survey papers that key
+# rows by an internal system id (e.g. Weiss et al. 2024's California Kepler
+# Survey table, keyed by a "K#####"-style KOI number) rather than a star name.
+GENERIC_MULTI_TARGET_ID_COLUMNS = ["Name", "Star", "Target", "Object", "Source", "Syst", "System"]
 
 
 def normalize_identifier(value):
     return re.sub(r'[^a-z0-9]', '', str(value).lower())
 
 
-def host_identifier_candidates(hostname, hd_name=None, hip_name=None):
+def extract_id_number(text, min_digits=2):
+    """The longest digit run in `text`, with leading zeros stripped -- the
+    catalog *number* portion of a designation like "KOI-260" or "HD 95128".
+
+    Deliberately the *longest* run, not the first: some catalog prefixes
+    embed a digit of their own right before the actual number (e.g.
+    "UCAC4 672070434", "Gaia DR1 2126918...", "2MASS J19172334...") --
+    taking the first digit run there would grab "4"/"1"/"2" instead of the
+    real id. Returns None if no run reaches `min_digits` digits, since a
+    1-digit "number" is too likely to just be an unrelated sequential
+    row/system index in some other multi-target table, not a real
+    cross-matchable designation.
+    """
+    runs = re.findall(r'\d+', text)
+    if not runs:
+        return None
+    longest = max(runs, key=len)
+    if len(longest) < min_digits:
+        return None
+    return longest.lstrip("0") or "0"
+
+
+def host_identifier_candidates(hostname, hd_name=None, hip_name=None, host_aliases=None):
     """Normalized strings that might identify `hostname` in a VizieR
-    table's per-row star-name column: its own name, plus its HD/HIP
-    designations both with and without the catalog prefix (one survey's
-    table might list "47 UMa", another "HD 95128", another a bare
-    "95128") -- for filtering tables that combine many stars' RVs into
+    table's per-row star-id column: its own name, plus its HD/HIP
+    designations and any other SIMBAD-known alias (KOI, KIC, TIC, ...;
+    see aliases.get_host_aliases) both with and without the catalog
+    prefix (one survey's table might list "47 UMa", another "HD 95128",
+    another a bare "95128", another a paper-specific "K00260" for
+    "KOI-260") -- for filtering tables that combine many stars' RVs into
     one table down to just this host's rows.
     """
     candidates = {normalize_identifier(hostname)}
-    for raw in (hd_name, hip_name):
-        if pd.notna(raw):
-            text = str(raw)
-            candidates.add(normalize_identifier(text))
-            m = re.search(r'(\d+)', text)
-            if m:
-                candidates.add(m.group(1).lstrip("0") or "0")
+    for text in list((hd_name, hip_name)) + list(host_aliases or []):
+        if pd.isna(text):
+            continue
+        text = str(text)
+        candidates.add(normalize_identifier(text))
+        number = extract_id_number(text)
+        if number:
+            candidates.add(number)
     return candidates
+
+
+def value_matches_candidates(value, candidates):
+    """True if a multi-target table's per-row id cell matches one of
+    `candidates` (see host_identifier_candidates) -- either as its full
+    normalized string, or by the bare digit run it contains with leading
+    zeros stripped (e.g. a table cell "K00260" matching a "260" candidate
+    from a host's "KOI-260" alias, where the table's own zero-padding/
+    abbreviated prefix convention won't match any normalized full string)."""
+    text = str(value)
+    if normalize_identifier(text) in candidates:
+        return True
+    number = extract_id_number(text)
+    return bool(number) and number in candidates
 
 
 def detect_multi_target_column(colnames):
@@ -230,7 +272,7 @@ def fetch_vizier_table(v, table_id):
     return None
 
 
-def download_vizier_table(hostname, source, out_dir):
+def download_vizier_table(hostname, source, out_dir, alias_cache=None, alias_cache_path="cache/simbad_aliases_cache.json"):
     v = Vizier(columns=["**"], row_limit=-1, timeout=180)
     table = fetch_vizier_table(v, source["table_id"])
     if table is None:
@@ -268,12 +310,21 @@ def download_vizier_table(hostname, source, out_dir):
                 print(f"  ! WARNING: {source['table_id']} combines RV data for {len(distinct)} different "
                       f"stars in one table, not just {hostname} ({n_total} rows total) -- "
                       "filtering to this host's rows only")
-                candidates = host_identifier_candidates(hostname, source.get("hd_name"), source.get("hip_name"))
-                table = table[[normalize_identifier(v) in candidates for v in table[id_col]]]
+                # Some survey tables key rows by a catalog number SIMBAD
+                # knows about (e.g. a KOI number) that the NEA export's own
+                # hd_name/hip_name columns don't carry -- look up this
+                # host's other known aliases too before giving up on a match.
+                host_aliases = aliases.get_host_aliases(
+                    hostname, alias_cache, alias_cache_path
+                ) if alias_cache is not None else []
+                candidates = host_identifier_candidates(
+                    hostname, source.get("hd_name"), source.get("hip_name"), host_aliases
+                )
+                table = table[[value_matches_candidates(v, candidates) for v in table[id_col]]]
                 if len(table) == 0:
                     print(f"    ! could not isolate {hostname}'s rows in this multi-target table "
-                          f"(no value in column {id_col} matched this host's name/HD/HIP designation) -- "
-                          "skipping rather than saving every star's RVs under this host")
+                          f"(no value in column {id_col} matched this host's name/HD/HIP designation or "
+                          "any other SIMBAD alias) -- skipping rather than saving every star's RVs under this host")
                     return None
                 print(f"    kept {len(table)}/{n_total} rows matching {id_col}")
                 filter_note = f"Filtered from the full {n_total}-row table (column {id_col}) to this host's rows only"
@@ -301,15 +352,37 @@ def download_vizier_table(hostname, source, out_dir):
     return out_path
 
 
-def download_dace_table(hostname, source, out_dir):
-    target = hostname.replace(" ", "")
+def query_dace_target(target):
     try:
         df = Spectroscopy.get_timeseries(target=target, output_format="pandas", sorted_by_instrument=False)
     except Exception as exc:
         print(f"  ! DACE query failed for {target}: {exc}")
         return None
-    if df is None or len(df) == 0:
-        print(f"  ! DACE returned no data for {target}")
+    return df if df is not None and len(df) else None
+
+
+def download_dace_table(hostname, source, out_dir, alias_cache=None, alias_cache_path="cache/simbad_aliases_cache.json"):
+    target = hostname.replace(" ", "")
+    df = query_dace_target(target)
+    used_target = target
+
+    if df is None and alias_cache is not None:
+        # DACE sometimes indexes a target under a different name than the
+        # host's own common name (e.g. a KIC/TIC id rather than "Kepler-126")
+        # -- retry under every other name SIMBAD knows for this host before
+        # giving up.
+        for alias in aliases.get_host_aliases(hostname, alias_cache, alias_cache_path):
+            alias_target = alias.replace(" ", "")
+            if alias_target == target:
+                continue
+            df = query_dace_target(alias_target)
+            if df is not None:
+                used_target = alias_target
+                print(f"  found DACE data for {hostname} under alias {alias_target}")
+                break
+
+    if df is None:
+        print(f"  ! DACE returned no data for {target}" + (" or any known alias" if alias_cache is not None else ""))
         return None
 
     trigger_line = (f"# Triggered by: {source['display']} ({source['bibcode']}) -- {source['dace_clue']}"
@@ -317,7 +390,7 @@ def download_dace_table(hostname, source, out_dir):
     lines = [
         f"# Host: {hostname}",
         "# Source: DACE archive (public mode, dace_query.spectroscopy.Spectroscopy.get_timeseries)",
-        f"# Target queried: {target}",
+        f"# Target queried: {used_target}" + (f" (alias of {hostname})" if used_target != target else ""),
         trigger_line,
         f"# Retrieved via dace_query on {date.today().isoformat()}",
         f"# {len(df.columns)} total columns returned; key columns:",
@@ -335,7 +408,8 @@ def download_dace_table(hostname, source, out_dir):
     return out_path
 
 
-def download_tables(vizier_csv, ads_csv, out_dir="downloaded_rv_tables", sleep=0.5):
+def download_tables(vizier_csv, ads_csv, out_dir="downloaded_rv_tables", sleep=0.5,
+                     alias_cache_path="cache/simbad_aliases_cache.json"):
     """Resolve and download RV tables for every Msini host, returning
     (sources, unresolved) where `sources` is the hostname -> resolved
     source list and `unresolved` is the list of hosts with no downloadable
@@ -350,6 +424,7 @@ def download_tables(vizier_csv, ads_csv, out_dir="downloaded_rv_tables", sleep=0
     sources, msini_hosts = resolve_sources(vizier_csv, ads_csv)
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True)
+    alias_cache = aliases.load_cache(alias_cache_path)
 
     for hostname in sorted(sources):
         host_dir = out_dir / sanitize(hostname)
@@ -357,9 +432,9 @@ def download_tables(vizier_csv, ads_csv, out_dir="downloaded_rv_tables", sleep=0
         print(hostname)
         for source in sources[hostname]:
             if source["type"] == "vizier":
-                download_vizier_table(hostname, source, host_dir)
+                download_vizier_table(hostname, source, host_dir, alias_cache, alias_cache_path)
             elif source["type"] == "dace":
-                download_dace_table(hostname, source, host_dir)
+                download_dace_table(hostname, source, host_dir, alias_cache, alias_cache_path)
             time.sleep(sleep)
 
     unresolved = sorted(msini_hosts - set(sources))

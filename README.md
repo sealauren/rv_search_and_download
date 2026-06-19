@@ -12,11 +12,17 @@ For every host star in the input table, this pipeline:
    matching RV keywords, and (c) actually contain an RV column -- verified
    by parsing the catalog's CDS ReadMe byte-by-byte column definitions,
    not just trusting the keyword match alone. Tables that belong to a
-   *different* host in a shared multi-target catalog are also filtered
-   out -- matched either by hostname text or, when a catalog splits data
-   across separate per-star tables titled with a bare HD/HIP number
-   instead of a common name, by the NEA's own `hd_name`/`hip_name`
-   designations for each host.
+   *different* star in a shared multi-target catalog are also filtered
+   out -- matched either by hostname text, by HD/HIP number (for catalogs
+   that title each per-target table with a bare HD/HIP number instead of
+   a common name), or by any other recognized stellar designation the
+   title itself names (GJ, LHS, LTT, TOI, KOI, KIC, TIC, Kepler, ... --
+   see `vizier_search.DESIGNATION_PREFIXES`) that isn't this host's own,
+   even when that other star isn't itself a host in your input catalog.
+   A survey-wide table that doesn't name any specific star in its title
+   (e.g. "Radial velocities from Keck-HIRES of 63 Kepler planet-hosting
+   stars") isn't excluded here -- isolating its rows to one host is stage
+   3's job (see below), since there's nothing in the title alone to check.
 
 2. **Falls back to a three-tier ADS/arXiv search** for hosts that have a
    literature Msini mass (proof an RV orbit was fit somewhere) but whose
@@ -40,19 +46,27 @@ For every host star in the input table, this pipeline:
    mass:
    - A direct VizieR table hit from stage 1. If the fetched table
      turns out to combine RV data for several different stars in one
-     table (a per-row `Name`/`Star`/`Target`/`Object`/`Source` column
-     with more than one distinct value -- common in older survey
-     papers), it's filtered down to this host's rows by matching that
-     column against the host's name and HD/HIP designations before
-     saving, rather than saving every star's RVs under this one host.
+     table (a per-row `Name`/`Star`/`Target`/`Object`/`Source`/`Syst`/
+     `System` column with more than one distinct value -- common in
+     older survey papers, and in combined-table surveys like Weiss et
+     al. 2024's California Kepler Survey, keyed by an internal KOI-style
+     system id rather than a star name), it's filtered down to this
+     host's rows by matching that column against the host's name,
+     HD/HIP designations, and every other alias SIMBAD knows for it
+     (KOI, KIC, TIC, ...; see `aliases.get_host_aliases`, cached to
+     `cache/simbad_aliases_cache.json`) before saving, rather than
+     saving every star's RVs under this one host.
    - Rosenthal et al. 2021's CLS table (J/ApJS/255/8/table6), filtered
      to this host's rows, when a CLS redirect was found in stage 2.
-   - A live query to the public DACE archive. DACE is attempted for
-     **every** Msini host -- not just those where stage 2 named DACE
-     explicitly -- because its public API is a plain target-name lookup
-     that needs no textual clue, and an aggregated dataset there is
-     valuable even when another source already exists, even if there
-     are some duplicate RVs.
+   - A live query to the public DACE archive, by hostname; if that
+     returns nothing, retried under every SIMBAD alias for the host
+     before giving up, since DACE sometimes indexes a target under a
+     KIC/TIC/Gaia-style id rather than its common name. DACE is
+     attempted for **every** Msini host -- not just those where stage 2
+     named DACE explicitly -- because its public API is a plain
+     target-name lookup that needs no textual clue, and an aggregated
+     dataset there is valuable even when another source already exists,
+     even if there are some duplicate RVs.
 
    Each downloaded file is saved to `downloaded_rv_tables/<host>/` with
    a commented header describing the source and every column's
@@ -167,6 +181,7 @@ rv_search_and_download/
 │   ├── ads_search.py       # stage 2
 │   ├── download.py         # stage 3
 │   ├── aggregate.py        # stage 4
+│   ├── aliases.py          # SIMBAD alias lookups, used by stage 3
 │   └── pipeline.py         # run_pipeline() + the rv-search-and-download CLI
 ├── sample_data/
 │   └── sample_data.csv     # tiny 3-system demo input
@@ -180,15 +195,17 @@ rv_search_and_download/
 
 | Stage | Module | Standalone command | What it does |
 |---|---|---|---|
-| 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables that (a) are from a journal-published catalog (`J/` class), (b) match RV keywords in the title/description, and (c) have an actual RV column per the catalog's CDS ReadMe. Tables belonging to a different host in a shared multi-target catalog are excluded -- by hostname text match, or by HD/HIP designation when the table is titled with a bare catalog number. Writes `vizier_rv_results.csv`. |
+| 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables that (a) are from a journal-published catalog (`J/` class), (b) match RV keywords in the title/description, and (c) have an actual RV column per the catalog's CDS ReadMe. Tables belonging to a different star in a shared multi-target catalog are excluded -- by hostname text match, by HD/HIP designation when the table is titled with a bare catalog number, or by any other recognized stellar designation (GJ, TOI, KOI, KIC, ...) the title names that isn't this host's own. Writes `vizier_rv_results.csv`. |
 | 2 | `ads_search.py` | `rv-ads-search` | For hosts with an Msini-derived mass but no VizieR hit: searches the cited paper's ADS abstract (tier 1), then its arXiv full text via ar5iv.org if available (tier 2), then ADS's own full-text index (tier 3), for a named RV instrument/survey or a CLS/DACE mention. Writes `ads_rv_instruments.csv`. Skipped entirely if stage 1 already resolved every Msini host. |
-| 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source(s) and downloads: direct VizieR table hits (filtering out any rows belonging to other stars if the fetched table actually combines several stars' RVs), the Rosenthal+2021 CLS table (filtered per host), and DACE (queried for every Msini host regardless of whether stage 2 found an explicit DACE clue). |
+| 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source(s) and downloads: direct VizieR table hits (filtering out any rows belonging to other stars if the fetched table actually combines several stars' RVs, matching by name, HD/HIP, or any SIMBAD-known alias -- see `aliases.py`), the Rosenthal+2021 CLS table (filtered per host), and DACE (queried for every Msini host regardless of whether stage 2 found an explicit DACE clue, retried under SIMBAD aliases if the host's own name returns nothing). |
 | 4 | `aggregate.py` | `rv-aggregate-rvs` | Reads every downloaded table for a host (using the commented header `download.py` already wrote -- no re-querying VizieR/DACE), standardizes time/RV/RV-error into BJD/m/s/m/s, median-subtracts RV within each (table, instrument) group, flags likely-duplicate RVs across tables, and writes `aggregated_rv_tables/<host>_rvs_aggregated.csv`. |
 
 Each stage caches its lookups by ADS bibcode under `cache/`
 (`cache/vizier_bibcode_cache.json`, `cache/vizier_readme_cache.json`,
 `cache/ads_abstract_cache.json`), so reruns -- even against a different
 input catalog -- never re-query a paper you've already resolved.
+Stage 3's SIMBAD alias lookups are cached the same way, by hostname,
+under `cache/simbad_aliases_cache.json`.
 
 Each of the four modules also works standalone via its own command
 (see the table); `rv-search-and-download` just chains them together. See
@@ -236,11 +253,20 @@ local` (or `--init-config global`) to write a starter file to edit.
   lettered multiples) can't be isolated and are skipped rather than
   returning the whole-survey table.
 - The generic multi-target table filter in stage 3 only recognizes a
-  per-row id column named `Name`, `Star`, `Target`, `Object`, or `Source`,
-  and only matches a host by its common name or HD/HIP designation; a
-  table that identifies stars some other way (a different column name, or
-  a different catalog like BD/Giclas) won't be detected as multi-target
-  and could still be saved unfiltered.
+  per-row id column named `Name`, `Star`, `Target`, `Object`, `Source`,
+  `Syst`, or `System`; a table that identifies stars some other way (a
+  different column name entirely) won't be detected as multi-target and
+  could still be saved unfiltered. Row matching itself covers a host's
+  common name, HD/HIP designation, and every other SIMBAD alias (KOI,
+  KIC, TIC, Gaia, 2MASS, ...) -- but only if SIMBAD actually has that host
+  on file and the table's id column uses one of those same designations
+  (a different catalog entirely, e.g. BD/Giclas, still won't match).
+- Stage 1's title-level multi-target exclusion (see "How it works" above)
+  only recognizes a curated set of stellar designation prefixes
+  (`vizier_search.DESIGNATION_PREFIXES`); a table titled for one specific
+  *other* star using a prefix not in that list won't be excluded there,
+  though stage 3's row-level filter (just above) can still catch it if
+  the table also carries a recognized multi-target id column.
 - DACE and VizieR are queried in public/anonymous mode; private or
   not-yet-public datasets won't be found.
 - Hosts where only a bare, non-DACE instrument name was found (no VizieR

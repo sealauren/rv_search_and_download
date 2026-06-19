@@ -265,6 +265,47 @@ def extract_catalog_numbers(text):
     return {"HD": set(HD_NUM_RE.findall(text)), "HIP": set(HIP_NUM_RE.findall(text))}
 
 
+# Common stellar-designation prefixes that show up in VizieR table titles
+# for *one specific star*, distinct from a survey-wide table that just
+# describes its general content (e.g. "Stellar properties and RV data
+# summary" -- no specific star named at all). Curated rather than a fully
+# generic "letters+digits" regex, which would also match ordinary phrases
+# like "Table 4" or "63 Kepler planet-hosting stars" (number-before-letters,
+# which this deliberately excludes -- see DESIGNATION_TOKEN_RE).
+DESIGNATION_PREFIXES = [
+    "HD", "HIP", "GJ", "GL", "LHS", "LTT", "LP", "BD", "TOI", "KOI", "KIC",
+    "TIC", "EPIC", "K2", "WASP", "HAT-P", "HATS", "KELT", "XO", "CoRoT",
+    "NGTS", "TrES", "Kepler",
+]
+DESIGNATION_TOKEN_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(p) for p in DESIGNATION_PREFIXES) + r')[\s\-]*0*(\d+)\b',
+    re.IGNORECASE,
+)
+
+
+def extract_designation_tokens(text):
+    """Pull out every recognized stellar designation in `text` as a set of
+    (prefix, number) tuples, e.g. {("gj", "1252")} for "GJ 1252". Used to
+    tell whether a table's title names a *specific* star at all -- and if
+    so, which one -- independent of whether that star happens to be a
+    known host in this run's input catalog (see table_belongs_to_other_host).
+    """
+    text = text or ""
+    return {(p.lower().replace("-", ""), n.lstrip("0") or "0") for p, n in DESIGNATION_TOKEN_RE.findall(text)}
+
+
+def host_designation_tokens(hostname, hd_name=None, hip_name=None):
+    """A host's own designation tokens (see extract_designation_tokens):
+    parsed from its common NEA name (which for many hosts -- "TOI-1235",
+    "Kepler-126", "GJ 1252" -- already *is* a recognized catalog
+    designation) plus its hd_name/hip_name columns."""
+    tokens = extract_designation_tokens(hostname)
+    for raw in (hd_name, hip_name):
+        if pd.notna(raw):
+            tokens |= extract_designation_tokens(str(raw))
+    return tokens
+
+
 def build_host_designations(df):
     """hostname -> {"HD": {...}, "HIP": {...}} parsed from the NEA catalog's
     hd_name/hip_name columns. Many multi-target VizieR catalogs (e.g. an
@@ -298,25 +339,39 @@ def host_primary_names(df):
     return names
 
 
-def table_belongs_to_other_host(table, hostname, other_hostnames, host_designations=None):
+def table_belongs_to_other_host(table, hostname, other_hostnames, host_designations=None,
+                                 hd_name=None, hip_name=None):
     """True if a table's id/title textually identifies it as belonging to
-    a *different* host in `other_hostnames`, not `hostname`. Some VizieR
-    catalogs cover multiple distinct targets in one paper, with separate
-    per-target tables (e.g. Lillo-Box et al. 2020's J/A+A/640/A48 has
-    "k2-32rv" and "k2-233rv" for two unrelated multi-planet systems that
-    both happen to cite that paper) -- without this check, every table
-    under a shared bibcode gets attached to every host citing it.
+    a *different* star than `hostname`. Some VizieR catalogs cover
+    multiple distinct targets in one paper, with separate per-target
+    tables (e.g. Lillo-Box et al. 2020's J/A+A/640/A48 has "k2-32rv" and
+    "k2-233rv" for two unrelated multi-planet systems that both happen to
+    cite that paper) -- without this check, every table under a shared
+    bibcode gets attached to every host citing it.
 
-    Checks HD/HIP catalog numbers (via `host_designations`, see
-    build_host_designations) before falling back to a plain hostname text
-    match -- needed because some surveys title each per-target table with
-    a bare HD/HIP number (e.g. "HD 95128" for 47 UMa) that won't contain
-    either host's common name as a literal substring.
+    Two checks, in order:
+      1. HD/HIP catalog numbers (via `host_designations`, see
+         build_host_designations) and a plain hostname text match --
+         needed because some surveys title each per-target table with a
+         bare HD/HIP number (e.g. "HD 95128" for 47 UMa) that won't
+         contain either host's common name as a literal substring. Only
+         excludes when the title positively names a *different host
+         that's also in this run's input catalog* (`other_hostnames`).
+      2. A generic stellar-designation token (see extract_designation_tokens)
+         that doesn't match this host's own tokens at all -- catches a
+         table titled for some *other* star the title positively names
+         (e.g. "GJ 1252 radial velocity curve"), even when that other star
+         isn't itself a host in this run to check against in step 1 (e.g.
+         a survey paper covering several stars, only one of which is in
+         your NEA export).
 
     Returns False (not someone else's) whenever there's no hint either
     way, so single-target catalogs -- the common case -- are unaffected;
-    this only fires when the table title/id positively names a
-    *different* known host.
+    a survey-wide table that doesn't name any specific star in its title
+    (e.g. "Radial velocities from Keck-HIRES of 63 Kepler planet-hosting
+    stars") also isn't excluded here -- isolating its rows to one host is
+    download.py's job (see detect_multi_target_column), not this title-only
+    check's.
     """
     raw_text = f"{table['table_id']} {table['table_title']}"
     text = normalize_host_slug(raw_text)
@@ -341,6 +396,10 @@ def table_belongs_to_other_host(table, hostname, other_hostnames, host_designati
         # match by coincidence inside unrelated text.
         if len(other_slug) >= 4 and other_slug in text:
             return True
+
+    table_tokens = extract_designation_tokens(raw_text)
+    if table_tokens and not (table_tokens & host_designation_tokens(hostname, hd_name, hip_name)):
+        return True
     return False
 
 
@@ -383,6 +442,45 @@ def load_cache(path):
 def save_cache(path, cache):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=1))
+
+
+def classify_bibcode_tables(tables, session, readme_cache, readme_cache_path, sleep, verbose):
+    """Run the catalog-class + RV-keyword + ReadMe checks for every table
+    returned for one bibcode, independent of which host is asking. Returns
+    a list of {"table": t, "rv_match": bool, "note": str} dicts.
+
+    Done once per bibcode (host-independent, cached by search_vizier in
+    bibcode_classified) since the result doesn't depend on which host is
+    currently being processed -- avoids re-running the ReadMe check for
+    every host that happens to cite the same bibcode.
+    """
+    classified = []
+    for t in tables:
+        rv_match = is_journal_table_catalog(t["catalog"]) and (
+            looks_like_rv(t["table_title"]) or looks_like_rv(t["catalog_description"])
+        )
+        note = ""
+        # A title/description keyword match is easy to fool -- e.g. a
+        # joint photometry+RV paper's table titled "...joint
+        # photo-dynamical+RV fit" matches on the bare "RV" even
+        # though that table holds fitted planet parameters, not RV
+        # data. Cross-check against the catalog's actual ReadMe
+        # column descriptions before trusting it.
+        if rv_match:
+            readme_tables = get_readme_rv_tables(
+                t["catalog"], session, readme_cache, sleep=sleep, verbose=verbose
+            )
+            save_cache(readme_cache_path, readme_cache)
+            stem = t["table_id"].rsplit("/", 1)[-1].lower()
+            if readme_tables is None:
+                note = "ReadMe unavailable; kept keyword match unverified"
+            elif stem not in readme_tables:
+                note = "table not found in ReadMe; kept keyword match unverified"
+            elif not readme_tables[stem]:
+                rv_match = False
+                note = "ReadMe shows no RV column in this table; keyword match overridden"
+        classified.append({"table": t, "rv_match": rv_match, "note": note})
+    return classified
 
 
 def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_cache.json",
@@ -432,6 +530,7 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
     session = requests.Session()
     rows = []
     failed_bibcodes = set()
+    bibcode_classified = {}  # bibcode -> classify_bibcode_tables(...) result, reused across hosts sharing it
     for hostname, refs in host_refs.items():
         hd_name, hip_name = all_names.get(hostname, (None, None))
         for ref in refs:
@@ -486,31 +585,14 @@ def search_vizier(input_csv, output_csv=None, cache_path="cache/vizier_bibcode_c
                     "note": "VizieR query failed; will retry next run" if query_failed else "no VizieR catalog found",
                     "hd_name": hd_name, "hip_name": hip_name,
                 })
-            for t in tables:
-                rv_match = is_journal_table_catalog(t["catalog"]) and (
-                    looks_like_rv(t["table_title"]) or looks_like_rv(t["catalog_description"])
+            if bibcode not in bibcode_classified:
+                bibcode_classified[bibcode] = classify_bibcode_tables(
+                    tables, session, readme_cache, readme_cache_path, sleep, verbose
                 )
-                note = ""
-                # A title/description keyword match is easy to fool -- e.g. a
-                # joint photometry+RV paper's table titled "...joint
-                # photo-dynamical+RV fit" matches on the bare "RV" even
-                # though that table holds fitted planet parameters, not RV
-                # data. Cross-check against the catalog's actual ReadMe
-                # column descriptions before trusting it.
-                if rv_match:
-                    readme_tables = get_readme_rv_tables(
-                        t["catalog"], session, readme_cache, sleep=sleep, verbose=verbose
-                    )
-                    save_cache(readme_cache_path, readme_cache)
-                    stem = t["table_id"].rsplit("/", 1)[-1].lower()
-                    if readme_tables is None:
-                        note = "ReadMe unavailable; kept keyword match unverified"
-                    elif stem not in readme_tables:
-                        note = "table not found in ReadMe; kept keyword match unverified"
-                    elif not readme_tables[stem]:
-                        rv_match = False
-                        note = "ReadMe shows no RV column in this table; keyword match overridden"
-                if rv_match and table_belongs_to_other_host(t, hostname, all_hostnames, all_designations):
+            for c in bibcode_classified[bibcode]:
+                t, rv_match, note = c["table"], c["rv_match"], c["note"]
+                if rv_match and table_belongs_to_other_host(t, hostname, all_hostnames, all_designations,
+                                                              hd_name, hip_name):
                     rv_match = False
                     note = "table id/title names a different host -- shared multi-target catalog, not this host's data"
                 rows.append({
