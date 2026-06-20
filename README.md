@@ -76,9 +76,10 @@ For every host star in the input table, this pipeline:
    analysis-ready file: standardizes time/RV/RV-error into BJD, RV (m/s),
    and RV error (m/s); median-subtracts the RV column within each
    (table, instrument) group to remove pipeline-to-pipeline systemic
-   offsets; and flags likely-duplicate RVs (same host and instrument,
-   timestamps from different tables within 10 seconds of each other) for
-   review, picking a default "preferred" row per a configurable policy.
+   offsets; and detects likely-duplicate RVs (same host and instrument,
+   timestamps from different tables within 10 seconds of each other),
+   keeping only one "preferred" row per group per a configurable policy
+   and dropping the rest, so the output has exactly one row per observation.
    Written to `aggregated_rv_tables/<host>_rvs_aggregated.csv` -- this is
    the file meant to be fed straight into RV-fitting tools like `radvel`.
 
@@ -198,7 +199,7 @@ rv_search_and_download/
 | 1 | `vizier_search.py` | `rv-vizier-search` | Parses every NEA reference column per host, queries VizieR by ADS bibcode (`-source=`), and flags tables that (a) are from a journal-published catalog (`J/` class), (b) match RV keywords in the title/description, and (c) have an actual RV column per the catalog's CDS ReadMe. Tables belonging to a different star in a shared multi-target catalog are excluded -- by hostname text match, by HD/HIP designation when the table is titled with a bare catalog number, or by any other recognized stellar designation (GJ, TOI, KOI, KIC, ...) the title names that isn't this host's own. Writes `vizier_rv_results.csv`. |
 | 2 | `ads_search.py` | `rv-ads-search` | For hosts with an Msini-derived mass but no VizieR hit: searches the cited paper's ADS abstract (tier 1), then its arXiv full text via ar5iv.org if available (tier 2), then ADS's own full-text index (tier 3), for a named RV instrument/survey or a CLS/DACE mention. Writes `ads_rv_instruments.csv`. Skipped entirely if stage 1 already resolved every Msini host. |
 | 3 | `download.py` | `rv-download-tables` | Resolves each host's concrete source(s) and downloads: direct VizieR table hits (filtering out any rows belonging to other stars if the fetched table actually combines several stars' RVs, matching by name, HD/HIP, or any SIMBAD-known alias -- see `aliases.py`), the Rosenthal+2021 CLS table (filtered per host), and DACE (queried for every Msini host regardless of whether stage 2 found an explicit DACE clue, retried under SIMBAD aliases if the host's own name returns nothing). |
-| 4 | `aggregate.py` | `rv-aggregate-rvs` | Reads every downloaded table for a host (using the commented header `download.py` already wrote -- no re-querying VizieR/DACE), standardizes time/RV/RV-error into BJD/m/s/m/s, median-subtracts RV within each (table, instrument) group, flags likely-duplicate RVs across tables, and writes `aggregated_rv_tables/<host>_rvs_aggregated.csv`. |
+| 4 | `aggregate.py` | `rv-aggregate-rvs` | Reads every downloaded table for a host (using the commented header `download.py` already wrote -- no re-querying VizieR/DACE), standardizes time/RV/RV-error into BJD/m/s/m/s, median-subtracts RV within each (table, instrument) group, detects likely-duplicate RVs across tables and drops every non-preferred row, and writes `aggregated_rv_tables/<host>_rvs_aggregated.csv`. |
 
 Each stage caches its lookups by ADS bibcode under `cache/`
 (`cache/vizier_bibcode_cache.json`, `cache/vizier_readme_cache.json`,
@@ -214,12 +215,14 @@ for its own `--flags`.
 
 ### Duplicate-RV resolution policy (stage 4)
 
-Stage 4 flags RVs from different downloaded tables as likely duplicates
+Stage 4 detects RVs from different downloaded tables as likely duplicates
 when they share a host and instrument and their timestamps are within 10
-seconds of each other (see `duplicate_group` in the output -- every row is
-kept for review, not silently dropped). Which row in a `duplicate_group`
-is marked `is_preferred` (the one to use for analysis) is controlled by a
-small JSON config:
+seconds of each other, keeps exactly one row per such group, and drops the
+rest -- the aggregated output never contains more than one row per
+observation. The kept row still carries a `duplicate_group` id (so you can
+see it had a duplicate elsewhere that was dropped), and the file's header
+comment records how many rows were dropped in total. Which row in a group
+is kept is controlled by a small JSON config:
 
 ```json
 {
