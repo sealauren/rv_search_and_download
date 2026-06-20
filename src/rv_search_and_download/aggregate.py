@@ -112,6 +112,34 @@ KNOWN_INSTRUMENT_CODE_LEGENDS = {
     "J_ApJS_255_8_table6": {"k": "HIRES-PRE04", "j": "HIRES-POST04", "apf": "APF", "lick": "HAMILTON"},
 }
 
+# DACE's own instrument-name spelling occasionally differs from the
+# canonical RV_INSTRUMENTS name detect_vizier_instrument's title-keyword
+# fallback returns (e.g. DACE's bare "HARPN" vs. everyone else's hyphenated
+# "HARPS-N") -- without normalizing this, the same physical instrument's
+# rows from VizieR and DACE never land in the same `instrument` group and
+# so can never be flagged as possible duplicates, no matter how close their
+# timestamps are. Deliberately just a spelling fix, not a version merge:
+# DACE's versioned HARPS labels (HARPS03/HARPS15, before/after its 2015
+# fiber upgrade) are left alone since those *are* meaningfully different
+# instruments for RV zero-point purposes.
+DACE_INSTRUMENT_ALIASES = {
+    "HARPN": "HARPS-N",
+}
+
+# A specific DACE-internal data quirk: every row DACE tags with this
+# publication bibcode (Dumusque et al. 2014's original HARPS-N RVs of
+# Kepler-10) carries an "rjd" exactly 50000 too large under the documented
+# "JD - 2400000" convention. Confirmed, not guessed: after subtracting
+# 50000, both the fractional day *and* the RV value of each of these rows
+# exactly match the independent VizieR mirror of the same dataset
+# (J/ApJ/789/154/table1) to measurement precision, while DACE's *other*
+# (untagged) HARPS-N rows for the same host use the documented offset
+# correctly -- so this is isolated to this one bibcode's ingestion, not a
+# general rjd bug.
+DACE_BIBCODE_RJD_CORRECTIONS = {
+    "2014ApJ...789..154D": -50000.0,
+}
+
 
 def parse_instrument_legend(desc):
     """Parse a column description like '[1,2] Instrument (1: ELODIE, 2:
@@ -217,6 +245,17 @@ def extract_retrieved_year(comments):
     return None
 
 
+def extract_table_title(comments):
+    """The VizieR table's own title (e.g. "HARPS-N RV measurements"), if
+    download.py wrote one -- often names the instrument even when the
+    table's column names/descriptions and sanitized id don't (see
+    detect_vizier_instrument)."""
+    for line in comments:
+        if line.startswith("# Table title:"):
+            return line[len("# Table title:"):].strip()
+    return None
+
+
 def find_time_column(columns):
     for name, info in columns.items():
         if TIME_NAME_RE.match(name) or TIME_DESC_RE.search(info["desc"]):
@@ -246,20 +285,25 @@ def unit_to_mps_factor(unit):
     return 1.0
 
 
-def detect_vizier_instrument(columns, table_id):
+def detect_vizier_instrument(columns, table_id, table_title=None):
     """Best-effort instrument label for a VizieR table, which usually has
     no per-row instrument column. Falls back to a stable per-table
     pseudo-label when no known RV instrument name shows up in the table's
-    own column names/descriptions -- duplicate detection then simply won't
-    match this table's rows against another source's, which is the correct
-    (conservative) behavior when the instrument truly can't be determined.
+    own column names/descriptions/title -- duplicate detection then simply
+    won't match this table's rows against another source's, which is the
+    correct (conservative) behavior when the instrument truly can't be
+    determined.
     """
-    haystack = table_id + " " + " ".join(f"{n} {i['desc']}" for n, i in columns.items())
-    found = sorted({i for i in RV_INSTRUMENTS if re.search(rf'\b{re.escape(i)}\b', haystack, re.IGNORECASE)})
+    haystack = table_id + " " + (table_title or "") + " " + " ".join(f"{n} {i['desc']}" for n, i in columns.items())
+    found = {i for i in RV_INSTRUMENTS if re.search(rf'\b{re.escape(i)}\b', haystack, re.IGNORECASE)}
+    # Drop a match that's purely a substring of another, longer match found
+    # in the same haystack (e.g. "HARPS" inside "HARPS-N") -- otherwise an
+    # unambiguous single-instrument table gets wrongly treated as ambiguous.
+    found = sorted(i for i in found if not any(i != j and i.upper() in j.upper() for j in found))
     return found[0] if len(found) == 1 else f"table:{table_id}"
 
 
-def load_vizier_table(path, columns):
+def load_vizier_table(path, columns, table_title=None):
     time_col, offset = find_time_column(columns)
     rv_col, err_col = find_rv_columns(columns)
     df = pd.read_csv(path, comment="#")
@@ -274,7 +318,7 @@ def load_vizier_table(path, columns):
             raw = raw.map(lambda v: legend.get(v, v))
         instrument = raw.map(normalize_instrument_label)
     else:
-        instrument = detect_vizier_instrument(columns, path.stem)
+        instrument = detect_vizier_instrument(columns, path.stem, table_title)
 
     out = pd.DataFrame({
         "time_bjd": df[time_col].astype(float) + offset,
@@ -293,11 +337,16 @@ def load_dace_table(path):
     if missing:
         return None, f"missing expected DACE column(s): {sorted(missing)}"
 
+    rjd = df["rjd"].astype(float)
+    if "pub_bibcode" in df.columns:
+        rjd = rjd + df["pub_bibcode"].map(DACE_BIBCODE_RJD_CORRECTIONS).fillna(0.0)
+
     out = pd.DataFrame({
-        "time_bjd": df["rjd"].astype(float) + 2400000.0,
+        "time_bjd": rjd + 2400000.0,
         "rv_raw_mps": df["rv"].astype(float),
         "rv_err_mps": df["rv_err"].astype(float),
-        "instrument": df["instrument_name"] if "instrument_name" in df.columns else "unknown",
+        "instrument": (df["instrument_name"].map(lambda v: DACE_INSTRUMENT_ALIASES.get(str(v), v))
+                       if "instrument_name" in df.columns else "unknown"),
         "source_bibcode": df["pub_bibcode"] if "pub_bibcode" in df.columns else None,
     })
     drop = [c for c in ("rjd", "rv", "rv_err", "instrument_name", "pub_bibcode") if c in df.columns]
@@ -317,7 +366,7 @@ def load_source_file(path):
     if source_type == "dace":
         df, warning = load_dace_table(path)
     elif source_type == "vizier":
-        df, warning = load_vizier_table(path, parse_column_metadata(comments))
+        df, warning = load_vizier_table(path, parse_column_metadata(comments), extract_table_title(comments))
     else:
         return None, "no recognized '# Source:' header (not produced by this pipeline's download stage?)"
     if df is None:
