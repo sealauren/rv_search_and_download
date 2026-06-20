@@ -288,10 +288,24 @@ local` (or `--init-config global`) to write a starter file to edit.
   table6, whose "Inst" codes -- k/j/apf/lick -- map to
   HIRES-PRE04/HIRES-POST04/APF/HAMILTON). Tables with none of the above
   fall back to a best-effort keyword match against known spectrograph
-  names in the title/column descriptions, and a per-table placeholder
-  label when that also fails -- which means some VizieR/DACE pairs using
-  the same underlying instrument still won't be recognized as possible
-  duplicates.
+  names in the table's own *VizieR title* (download.py writes it into the
+  saved file's header specifically so aggregate.py can use it -- a table's
+  columns/id alone often don't name the instrument at all) and column
+  descriptions, and a per-table placeholder label when that also fails --
+  which means some VizieR/DACE pairs using the same underlying instrument
+  still won't be recognized as possible duplicates. DACE's own instrument
+  names are matched against this same keyword list via a small alias map
+  (`aggregate.DACE_INSTRUMENT_ALIASES`, currently just DACE's bare
+  "HARPN" -> the hyphenated "HARPS-N" everyone else uses) -- a different
+  DACE/VizieR spelling of the same instrument that isn't in that map won't
+  be recognized either.
+- One DACE-internal data quirk is hardcoded around:
+  `aggregate.DACE_BIBCODE_RJD_CORRECTIONS` corrects an exactly-50000-too-
+  large `rjd` for every row DACE tags with bibcode 2014ApJ...789..154D
+  (Dumusque et al. 2014's original Kepler-10 HARPS-N RVs) -- confirmed by
+  matching fractional day and RV value against the independent VizieR
+  mirror of the same dataset. There may be other DACE-tagged datasets with
+  similar (uncorrected) timestamp issues that just haven't been noticed yet.
 
 ## License
 

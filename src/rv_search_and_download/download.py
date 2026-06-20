@@ -189,6 +189,7 @@ def resolve_sources(vizier_csv, ads_csv):
             "type": "vizier", "catalog": r["vizier_catalog"], "table_id": r["vizier_table"],
             "bibcode": r["bibcode"], "display": r["display"],
             "hd_name": r.get("hd_name"), "hip_name": r.get("hip_name"),
+            "table_title": r.get("table_title"),
         })
 
     for _, r in ads[ads["mentions_cls"] & ads["hostname"].isin(msini_hosts)].iterrows():
@@ -336,6 +337,12 @@ def download_vizier_table(hostname, source, out_dir, alias_cache=None, alias_cac
         f"# ADS: https://ui.adsabs.harvard.edu/abs/{source['bibcode']}/abstract",
         f"# Retrieved via astroquery.vizier on {date.today().isoformat()}",
     ]
+    # The table's own VizieR title (e.g. "HARPS-N RV measurements") often
+    # names the instrument even when the table's columns/id don't --
+    # written here so aggregate.py's detect_vizier_instrument can use it,
+    # since this is the only stage that ever sees vizier_search's title text.
+    if source.get("table_title") and pd.notna(source["table_title"]):
+        lines.append(f"# Table title: {source['table_title']}")
     if filter_note:
         lines.append(f"# NOTE: {filter_note}")
     lines.append("# Columns:")
