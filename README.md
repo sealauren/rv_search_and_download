@@ -134,7 +134,9 @@ matching `aggregated_rv_tables/<host>_rvs_aggregated.csv` for each.
 
 You will see a harmless warning at startup about a missing `.dacerc` file
 -- that file is only needed for authenticated/private DACE access; public
-queries (which is all this pipeline does) work without it.
+queries (which is all this pipeline does) work without it. You'll also see
+a one-time message that `rv_aggregate_config.json` was created (see
+"Duplicate-RV resolution policy" below) -- this is expected on a fresh run.
 
 The `cache/` directory is populated on first run; subsequent runs against
 the same or an overlapping catalog skip live network queries for any
@@ -189,7 +191,7 @@ rv_search_and_download/
 ├── cache/                  # gitignored; bibcode -> lookup caches, created on first run
 ├── downloaded_rv_tables/   # gitignored; stage 3 output, created on first run
 ├── aggregated_rv_tables/   # gitignored; stage 4 output, created on first run
-└── rv_aggregate_config.json  # optional; local override of stage 4's duplicate-resolution policy
+└── rv_aggregate_config.json  # auto-created on first run; local override of stage 4's duplicate-resolution policy
 ```
 
 ## How it works
@@ -227,21 +229,29 @@ is kept is controlled by a small JSON config:
 ```json
 {
   "duplicate_default": "prefer_source",
-  "preferred_source_order": ["dace", "vizier"]
+  "preferred_source_order": ["vizier", "dace"]
 }
 ```
 
 - `"duplicate_default": "prefer_source"` (the default) always prefers
-  whichever source appears earliest in `preferred_source_order`.
+  whichever source appears earliest in `preferred_source_order`. Within
+  that same source (e.g. two different VizieR tables covering the same
+  observation), the more recently published one wins.
 - `"duplicate_default": "most_recent"` instead prefers whichever row's
-  publication is more recent (parsed from its ADS bibcode, or the
-  retrieval date as a fallback).
+  publication is more recent outright (parsed from its ADS bibcode, or the
+  retrieval date as a fallback), regardless of source.
 
 Stage 4 looks for `rv_aggregate_config.json` in the current directory
 first (a per-project/per-directory override), then falls back to
 `~/.config/rv_search_and_download/config.json` (a global default), then
-its built-in defaults shown above. Run `rv-aggregate-rvs --init-config
-local` (or `--init-config global`) to write a starter file to edit.
+its built-in defaults shown above. **If neither file exists, stage 4
+writes `rv_aggregate_config.json` itself** with the active (default)
+settings the first time it runs, and prints the path -- so the policy is
+always a visible, editable file rather than a value buried in source code.
+Edit it (or delete it to fall back to the built-in defaults), or run
+`rv-aggregate-rvs --init-config global` to write the starter file
+globally instead. The active policy and where it came from is also
+printed at the start of every run.
 
 ## Known limitations
 

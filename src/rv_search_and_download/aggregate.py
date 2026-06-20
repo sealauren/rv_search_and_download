@@ -47,10 +47,12 @@ DUPLICATE_WINDOW_SECONDS = 10.0
 
 DEFAULT_CONFIG = {
     # "prefer_source": always pick the row whose source_type is earliest in
-    # preferred_source_order. "most_recent": pick the row with the latest
-    # `year` (parsed from its bibcode, falling back to retrieval date).
+    # preferred_source_order (ties within the same source_type broken by
+    # the more recent publication year, then alphabetically). "most_recent":
+    # pick the row with the latest `year` outright (parsed from its
+    # bibcode, falling back to retrieval date), regardless of source_type.
     "duplicate_default": "prefer_source",
-    "preferred_source_order": ["dace", "vizier"],
+    "preferred_source_order": ["vizier", "dace"],
 }
 
 LOCAL_CONFIG_NAME = "rv_aggregate_config.json"
@@ -174,20 +176,32 @@ def normalize_instrument_label(raw):
     return raw
 
 
-def load_config(start_dir="."):
+def load_config(start_dir=".", auto_create=True):
     """Load duplicate-resolution settings: a local rv_aggregate_config.json
     in `start_dir` takes priority, then a global config under
-    ~/.config/rv_search_and_download/, then the built-in defaults."""
+    ~/.config/rv_search_and_download/, then the built-in defaults.
+
+    If neither config file exists and `auto_create` is True, a local
+    rv_aggregate_config.json is written with the active (built-in default)
+    settings -- so the duplicate-resolution policy is always a visible,
+    editable file rather than a value buried in this module's source,
+    matching what `--init-config` does on request.
+    """
     local_path = Path(start_dir) / LOCAL_CONFIG_NAME
     if local_path.exists():
         return {**DEFAULT_CONFIG, **json.loads(local_path.read_text())}, str(local_path)
     if GLOBAL_CONFIG_PATH.exists():
         return {**DEFAULT_CONFIG, **json.loads(GLOBAL_CONFIG_PATH.read_text())}, str(GLOBAL_CONFIG_PATH)
+    if auto_create:
+        path = write_starter_config("local", start_dir)
+        print(f"No duplicate-resolution config found -- wrote one with the default settings to {path}. "
+              "Edit this file to change which source is preferred, or delete it to go back to the built-in defaults.")
+        return dict(DEFAULT_CONFIG), str(path)
     return dict(DEFAULT_CONFIG), "built-in defaults"
 
 
-def write_starter_config(scope):
-    path = Path(LOCAL_CONFIG_NAME) if scope == "local" else GLOBAL_CONFIG_PATH
+def write_starter_config(scope, start_dir="."):
+    path = Path(start_dir) / LOCAL_CONFIG_NAME if scope == "local" else GLOBAL_CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
     return path
@@ -438,7 +452,15 @@ def choose_preferred(df, group_id, config):
                 -rank.get(df.at[i, "source_type"], len(order)),
             ))
         else:
-            best = min(idx, key=lambda i: (rank.get(df.at[i, "source_type"], len(order)), df.at[i, "source_table"]))
+            # Within the same preferred source_type (e.g. two different
+            # VizieR tables covering the same observation), prefer the more
+            # recent publication year before falling back to alphabetical
+            # source_table as a last-resort tiebreak.
+            best = min(idx, key=lambda i: (
+                rank.get(df.at[i, "source_type"], len(order)),
+                -(df.at[i, "year"] if pd.notna(df.at[i, "year"]) else -1),
+                df.at[i, "source_table"],
+            ))
         for i in idx:
             is_preferred.at[i] = (i == best)
     return is_preferred
@@ -545,6 +567,8 @@ def aggregate_all(downloaded_dir="downloaded_rv_tables", out_dir="aggregated_rv_
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     config, config_source = load_config(config_dir)
+    print(f"Duplicate-resolution policy: {config.get('duplicate_default')} "
+          f"(preferred_source_order={config.get('preferred_source_order')}) -- from {config_source}")
 
     wanted = {h.strip() for h in host.split(",")} if host else None
 
