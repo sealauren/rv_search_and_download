@@ -15,12 +15,12 @@ tables into a single analysis-ready file:
     many physically distinct instruments (e.g. CORAVEL ~-16500 m/s vs.
     HAMILTON ~0 m/s for the same star) -- subtracting one whole-table
     median would leave most of those instruments' offsets untouched.
-  - Flags likely-duplicate RVs: same host, same instrument, timestamps from
-    different source tables within DUPLICATE_WINDOW_SECONDS of each other
-    (transitively grouped, not strict pairwise matching). Each such group
-    gets a shared duplicate_group id; exactly one row per group is marked
-    is_preferred=True per a configurable default-source policy (see
-    load_config), and the rest are kept (is_preferred=False) for review.
+  - Detects likely-duplicate RVs: same host, same instrument, timestamps
+    from different source tables within DUPLICATE_WINDOW_SECONDS of each
+    other (transitively grouped, not strict pairwise matching). Exactly one
+    row per such group is kept -- chosen per a configurable default-source
+    policy (see load_config) -- and every other row in the group is
+    dropped, so the output has exactly one row per observation.
   - Writes aggregated_rv_tables/<host>_rvs_aggregated.csv.
 
 Source type (VizieR vs. DACE) and column metadata are read directly back
@@ -47,10 +47,12 @@ DUPLICATE_WINDOW_SECONDS = 10.0
 
 DEFAULT_CONFIG = {
     # "prefer_source": always pick the row whose source_type is earliest in
-    # preferred_source_order. "most_recent": pick the row with the latest
-    # `year` (parsed from its bibcode, falling back to retrieval date).
+    # preferred_source_order (ties within the same source_type broken by
+    # the more recent publication year, then alphabetically). "most_recent":
+    # pick the row with the latest `year` outright (parsed from its
+    # bibcode, falling back to retrieval date), regardless of source_type.
     "duplicate_default": "prefer_source",
-    "preferred_source_order": ["dace", "vizier"],
+    "preferred_source_order": ["vizier", "dace"],
 }
 
 LOCAL_CONFIG_NAME = "rv_aggregate_config.json"
@@ -174,20 +176,32 @@ def normalize_instrument_label(raw):
     return raw
 
 
-def load_config(start_dir="."):
+def load_config(start_dir=".", auto_create=True):
     """Load duplicate-resolution settings: a local rv_aggregate_config.json
     in `start_dir` takes priority, then a global config under
-    ~/.config/rv_search_and_download/, then the built-in defaults."""
+    ~/.config/rv_search_and_download/, then the built-in defaults.
+
+    If neither config file exists and `auto_create` is True, a local
+    rv_aggregate_config.json is written with the active (built-in default)
+    settings -- so the duplicate-resolution policy is always a visible,
+    editable file rather than a value buried in this module's source,
+    matching what `--init-config` does on request.
+    """
     local_path = Path(start_dir) / LOCAL_CONFIG_NAME
     if local_path.exists():
         return {**DEFAULT_CONFIG, **json.loads(local_path.read_text())}, str(local_path)
     if GLOBAL_CONFIG_PATH.exists():
         return {**DEFAULT_CONFIG, **json.loads(GLOBAL_CONFIG_PATH.read_text())}, str(GLOBAL_CONFIG_PATH)
+    if auto_create:
+        path = write_starter_config("local", start_dir)
+        print(f"No duplicate-resolution config found -- wrote one with the default settings to {path}. "
+              "Edit this file to change which source is preferred, or delete it to go back to the built-in defaults.")
+        return dict(DEFAULT_CONFIG), str(path)
     return dict(DEFAULT_CONFIG), "built-in defaults"
 
 
-def write_starter_config(scope):
-    path = Path(LOCAL_CONFIG_NAME) if scope == "local" else GLOBAL_CONFIG_PATH
+def write_starter_config(scope, start_dir="."):
+    path = Path(start_dir) / LOCAL_CONFIG_NAME if scope == "local" else GLOBAL_CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
     return path
@@ -438,7 +452,15 @@ def choose_preferred(df, group_id, config):
                 -rank.get(df.at[i, "source_type"], len(order)),
             ))
         else:
-            best = min(idx, key=lambda i: (rank.get(df.at[i, "source_type"], len(order)), df.at[i, "source_table"]))
+            # Within the same preferred source_type (e.g. two different
+            # VizieR tables covering the same observation), prefer the more
+            # recent publication year before falling back to alphabetical
+            # source_table as a last-resort tiebreak.
+            best = min(idx, key=lambda i: (
+                rank.get(df.at[i, "source_type"], len(order)),
+                -(df.at[i, "year"] if pd.notna(df.at[i, "year"]) else -1),
+                df.at[i, "source_table"],
+            ))
         for i in idx:
             is_preferred.at[i] = (i == best)
     return is_preferred
@@ -447,13 +469,17 @@ def choose_preferred(df, group_id, config):
 FRONT_COLUMNS = [
     "host", "time_bjd", "rv_mps", "rv_err_mps", "rv_raw_mps", "rv_median_subtracted_mps",
     "instrument", "source_table", "source_type", "source_bibcode", "year",
-    "duplicate_group", "is_preferred",
+    "duplicate_group",
 ]
 
 
 def aggregate_host(host_dir, hostname, config, window_seconds=DUPLICATE_WINDOW_SECONDS):
     """Combine every downloaded RV table for one host into a single
-    analysis-ready DataFrame. Returns (DataFrame or None, warnings, source_files)."""
+    analysis-ready DataFrame, dropping every non-preferred row of each
+    detected duplicate group (see choose_preferred) so the output contains
+    exactly one row per observation. Returns (DataFrame or None, warnings,
+    source_files, n_dropped) -- n_dropped is the number of rows removed as
+    duplicates (0 if df is None)."""
     files = sorted(p for p in host_dir.glob("*.csv") if not p.name.endswith("_rvs_aggregated.csv"))
     frames, warnings, used = [], [], []
     for path in files:
@@ -468,7 +494,7 @@ def aggregate_host(host_dir, hostname, config, window_seconds=DUPLICATE_WINDOW_S
         frames.append(df)
         used.append(path.name)
     if not frames:
-        return None, warnings, used
+        return None, warnings, used, 0
 
     combined = pd.concat(frames, ignore_index=True, sort=False)
 
@@ -482,13 +508,15 @@ def aggregate_host(host_dir, hostname, config, window_seconds=DUPLICATE_WINDOW_S
     combined = combined.drop(columns=["_fallback_year"])
 
     combined["duplicate_group"] = find_duplicate_groups(combined, window_seconds=window_seconds)
-    combined["is_preferred"] = choose_preferred(combined, combined["duplicate_group"], config)
+    is_preferred = choose_preferred(combined, combined["duplicate_group"], config)
+    n_dropped = int((~is_preferred).sum())
+    combined = combined[is_preferred].reset_index(drop=True)
 
     combined.insert(0, "host", hostname)
     combined = combined.sort_values("time_bjd").reset_index(drop=True)
     extra_cols = [c for c in combined.columns if c not in FRONT_COLUMNS]
     combined = combined[FRONT_COLUMNS + extra_cols]
-    return combined, warnings, used
+    return combined, warnings, used, n_dropped
 
 
 COLUMN_DOCS = [
@@ -502,12 +530,13 @@ COLUMN_DOCS = [
     ("source_type", "-", "vizier or dace"),
     ("source_bibcode", "-", "ADS bibcode for this row's source/publication, if known"),
     ("year", "-", "Publication/retrieval year used for the 'most_recent' duplicate policy"),
-    ("duplicate_group", "-", "Shared id for rows flagged as likely the same observation from different tables (blank = no duplicate found)"),
-    ("is_preferred", "-", "True for the row to use for analysis within a duplicate_group; all non-duplicate rows are True"),
+    ("duplicate_group", "-", "Shared id for rows that had at least one other likely-duplicate observation from a "
+                             "different source table, dropped in favor of this one per the duplicate-resolution "
+                             "policy below (blank = no duplicate found)"),
 ]
 
 
-def write_aggregated(out_path, hostname, df, config, config_source, used_files, warnings):
+def write_aggregated(out_path, hostname, df, config, config_source, used_files, warnings, n_dropped=0):
     lines = [
         f"# Host: {hostname}",
         f"# Aggregated from {len(used_files)} source table(s): {', '.join(used_files)}",
@@ -515,6 +544,8 @@ def write_aggregated(out_path, hostname, df, config, config_source, used_files, 
         f"# Duplicate-detection window: {DUPLICATE_WINDOW_SECONDS}s; "
         f"policy: {config.get('duplicate_default')} "
         f"(preferred_source_order={config.get('preferred_source_order')}) -- from {config_source}",
+        f"# {n_dropped} duplicate row(s) from other source tables dropped (see duplicate_group below for "
+        "which kept rows had one).",
     ]
     for w in warnings:
         lines.append(f"# WARNING: skipped {w}")
@@ -536,6 +567,8 @@ def aggregate_all(downloaded_dir="downloaded_rv_tables", out_dir="aggregated_rv_
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     config, config_source = load_config(config_dir)
+    print(f"Duplicate-resolution policy: {config.get('duplicate_default')} "
+          f"(preferred_source_order={config.get('preferred_source_order')}) -- from {config_source}")
 
     wanted = {h.strip() for h in host.split(",")} if host else None
 
@@ -545,16 +578,16 @@ def aggregate_all(downloaded_dir="downloaded_rv_tables", out_dir="aggregated_rv_
         if wanted and hostname not in wanted and host_dir.name not in wanted:
             continue
         print(hostname)
-        df, warnings, used = aggregate_host(host_dir, hostname, config, window_seconds)
+        df, warnings, used, n_dropped = aggregate_host(host_dir, hostname, config, window_seconds)
         for w in warnings:
             print(f"  ! {w}")
         if df is None:
             print("  ! no usable source tables -- skipping")
             continue
-        n_dup = int(df["duplicate_group"].notna().sum())
         out_path = out_dir / f"{sanitize(hostname)}_rvs_aggregated.csv"
-        write_aggregated(out_path, hostname, df, config, config_source, used, warnings)
-        print(f"  wrote {out_path} ({len(df)} rows from {len(used)} table(s), {n_dup} flagged as possible duplicates)")
+        write_aggregated(out_path, hostname, df, config, config_source, used, warnings, n_dropped)
+        print(f"  wrote {out_path} ({len(df)} rows from {len(used)} table(s), "
+              f"{n_dropped} duplicate row(s) dropped)")
         results[hostname] = out_path
 
     return results
