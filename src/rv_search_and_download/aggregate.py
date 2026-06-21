@@ -351,6 +351,16 @@ def load_dace_table(path):
     if missing:
         return None, f"missing expected DACE column(s): {sorted(missing)}"
 
+    # DACE keeps every reprocessing of an observation under successive
+    # pipeline (DRS) versions, not just the current one -- an outdated
+    # reduction is effectively a same-table duplicate of its own latest
+    # reduction (same timestamp/instrument) that the cross-table duplicate
+    # detection below would never catch, since it only compares rows from
+    # *different* source tables. Drop anything not flagged as the latest
+    # reduction before that detection ever runs.
+    if "is_latest_drs" in df.columns:
+        df = df[df["is_latest_drs"] != False].reset_index(drop=True)  # noqa: E712 (NaN must stay, only drop literal False)
+
     rjd = df["rjd"].astype(float)
     if "pub_bibcode" in df.columns:
         rjd = rjd + df["pub_bibcode"].map(DACE_BIBCODE_RJD_CORRECTIONS).fillna(0.0)
