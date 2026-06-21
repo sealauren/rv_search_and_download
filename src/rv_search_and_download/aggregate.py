@@ -406,12 +406,44 @@ def load_source_file(path):
     return df, None
 
 
+def time_precision_days(value):
+    """Granularity implied by how many decimal digits a time value was
+    written with (e.g. "...075.773" -> 0.001 days, ~86s). Some sources
+    round their published timestamps far more coarsely than others
+    reporting the very same observation (confirmed for Kepler-10: Batalha
+    et al. 2011's archival HIRES BJDs have 2-3 decimal digits, while Weiss
+    et al. 2024's re-publication of the same exposures has 4-5) -- a fixed
+    matching window sized for the *precise* side would otherwise miss
+    these pairs entirely, since the coarse side can legitimately be off by
+    up to half its own rounding step. Returns 0.0 if `value` has no
+    decimal part to measure (an exact value, or scientific notation).
+    """
+    s = repr(float(value))
+    if "e" in s.lower() or "." not in s:
+        return 0.0
+    return 10.0 ** (-len(s.split(".")[1]))
+
+
 def find_duplicate_groups(df, window_seconds=DUPLICATE_WINDOW_SECONDS):
     """Union-find over rows sharing an instrument, sorted by time: any two
-    rows from *different* source tables within `window_seconds` of each
-    other are linked (transitively) into the same group. Returns a Series
-    aligned to df.index: an integer group id for rows with at least one
-    match, NA otherwise."""
+    rows within the matching tolerance of each other are linked
+    (transitively) into the same group, *unless* they come from the exact
+    same (source_table, source_bibcode) pair -- two rows that close
+    together from the very same table and publication are a real,
+    intentional pair of observations, not a duplicate. Rows from a
+    different table, or from the same DACE download but tagged with a
+    different publication bibcode (DACE keeps re-submitted/reprocessed
+    historical data under its new paper's bibcode without removing the
+    original paper's own copy), are linked.
+
+    The matching tolerance is `window_seconds`, widened per-pair to half
+    the coarser of the two rows' own apparent timestamp rounding (see
+    time_precision_days) -- so a coarsely-rounded source isn't compared
+    against a precise one using a tolerance sized for the precise side.
+
+    Returns a Series aligned to df.index: an integer group id for rows
+    with at least one match, NA otherwise.
+    """
     window_days = window_seconds / 86400.0
     n = len(df)
     parent = list(range(n))
@@ -429,14 +461,31 @@ def find_duplicate_groups(df, window_seconds=DUPLICATE_WINDOW_SECONDS):
         if ri != rj:
             parent[ri] = rj
 
+    def table_bibcode_key(i):
+        # A missing bibcode must compare equal to another missing bibcode
+        # (NaN != NaN in a plain tuple comparison would otherwise treat
+        # every pair of same-table, no-bibcode rows as "different sources"
+        # and wrongly link any two of them that just happen to be close in
+        # time, e.g. consecutive exposures of the same star).
+        bibcode = df.at[i, "source_bibcode"]
+        return df.at[i, "source_table"], bibcode if pd.notna(bibcode) else None
+
+    tol = (df["time_bjd"].map(time_precision_days) / 2).clip(lower=window_days)
+
     for _, idx in df.groupby("instrument").groups.items():
         order = sorted(idx, key=lambda i: df.at[i, "time_bjd"])
+        # A safe (possibly loose) upper bound to scan to -- the actual
+        # union below still applies the precise per-pair tolerance, so
+        # scanning a few extra candidates here costs time, not correctness.
+        max_tol = tol.loc[order].max() if len(order) else window_days
         for a in range(len(order)):
             i = order[a]
             b = a + 1
-            while b < len(order) and df.at[order[b], "time_bjd"] - df.at[i, "time_bjd"] <= window_days:
+            while b < len(order) and df.at[order[b], "time_bjd"] - df.at[i, "time_bjd"] <= max_tol:
                 j = order[b]
-                if df.at[i, "source_table"] != df.at[j, "source_table"]:
+                pair_tol = max(tol.at[i], tol.at[j])
+                if (df.at[j, "time_bjd"] - df.at[i, "time_bjd"] <= pair_tol
+                        and table_bibcode_key(i) != table_bibcode_key(j)):
                     union(i, j)
                 b += 1
 

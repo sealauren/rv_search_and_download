@@ -219,14 +219,33 @@ for its own `--flags`.
 
 ### Duplicate-RV resolution policy (stage 4)
 
-Stage 4 detects RVs from different downloaded tables as likely duplicates
-when they share a host and instrument and their timestamps are within 10
-seconds of each other, keeps exactly one row per such group, and drops the
-rest -- the aggregated output never contains more than one row per
-observation. The kept row still carries a `duplicate_group` id (so you can
-see it had a duplicate elsewhere that was dropped), and the file's header
-comment records how many rows were dropped in total. Which row in a group
-is kept is controlled by a small JSON config:
+Stage 4 detects likely-duplicate RVs as rows that share a host and
+instrument and fall within 10 seconds of each other, *unless* they come
+from the exact same (downloaded file, publication bibcode) pair -- two
+close-together rows from the very same table and paper are a real,
+intentional pair of observations, not a duplicate. This catches both:
+- the common case of the same observation appearing in two different
+  downloaded files (e.g. a VizieR table and DACE), and
+- DACE re-publishing the same historical observations under a newer
+  paper's bibcode *within the same downloaded `dace.csv`*, without
+  removing the original paper's own copy -- confirmed for several hosts
+  in testing (e.g. tau Cet's and HD 219134's HAMILTON data appearing under
+  both Fischer et al. 2014 and Rosenthal et al. 2021).
+
+The 10-second window itself widens per-pair when a source's timestamps are
+written with visibly less decimal precision than the row it's being
+compared against (e.g. Batalha et al. 2011's archival HIRES BJDs for
+Kepler-10 have only 2-3 decimal digits -- DACE has since re-published the
+same exposures under Weiss et al. 2024 with 4-5 -- a fixed 10s window
+would miss that pair, since the coarser timestamp can be off by tens of
+seconds purely from rounding).
+
+Exactly one row per duplicate group is kept, and the rest are dropped --
+the aggregated output never contains more than one row per observation.
+The kept row still carries a `duplicate_group` id (so you can see it had a
+duplicate elsewhere that was dropped), and the file's header comment
+records how many rows were dropped in total. Which row in a group is kept
+is controlled by a small JSON config:
 
 ```json
 {
