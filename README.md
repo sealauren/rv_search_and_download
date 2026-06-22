@@ -78,8 +78,8 @@ For every host star in the input table, this pipeline:
    (DRS) reprocessing of the same observation (`is_latest_drs == False`);
    median-subtracts the RV column within each (table, instrument) group to
    remove pipeline-to-pipeline systemic offsets; and detects likely-duplicate
-   RVs (same host and instrument,
-   timestamps from different tables within 10 seconds of each other),
+   RVs (same host and instrument, timestamps within 90 seconds of each
+   other, widened further for coarsely-rounded timestamps -- see below),
    keeping only one "preferred" row per group per a configurable policy
    and dropping the rest, so the output has exactly one row per observation.
    Written to `aggregated_rv_tables/<host>_rvs_aggregated.csv` -- this is
@@ -220,10 +220,15 @@ for its own `--flags`.
 ### Duplicate-RV resolution policy (stage 4)
 
 Stage 4 detects likely-duplicate RVs as rows that share a host and
-instrument and fall within 10 seconds of each other, *unless* they come
+instrument and fall within 90 seconds of each other, *unless* they come
 from the exact same (downloaded file, publication bibcode) pair -- two
 close-together rows from the very same table and paper are a real,
-intentional pair of observations, not a duplicate. This catches both:
+intentional pair of observations from that pipeline, never a duplicate of
+each other. This constraint is enforced even *transitively*: candidate
+matches are merged closest-in-time first, and a merge is refused outright
+if it would ever put two same-(file, bibcode) rows in one group, however
+they'd otherwise get chained together through a third row from a
+different source. This catches both:
 - the common case of the same observation appearing in two different
   downloaded files (e.g. a VizieR table and DACE), and
 - DACE re-publishing the same historical observations under a newer
@@ -232,13 +237,19 @@ intentional pair of observations, not a duplicate. This catches both:
   in testing (e.g. tau Cet's and HD 219134's HAMILTON data appearing under
   both Fischer et al. 2014 and Rosenthal et al. 2021).
 
-The 10-second window itself widens per-pair when a source's timestamps are
-written with visibly less decimal precision than the row it's being
-compared against (e.g. Batalha et al. 2011's archival HIRES BJDs for
-Kepler-10 have only 2-3 decimal digits -- DACE has since re-published the
-same exposures under Weiss et al. 2024 with 4-5 -- a fixed 10s window
-would miss that pair, since the coarser timestamp can be off by tens of
-seconds purely from rounding).
+The 90-second window itself is sized to absorb a real, bounded, named
+systematic -- some pipelines report BJD on the UTC timescale, others on
+the modern TDB/TT standard, a gap that's exactly the current leap-second
+offset (69.184s since 2017, 67.184s as far back as 2012) -- confirmed
+against a real pair: a Kepler-10 HARPS-N exposure differs by 67.64s
+between Dumusque et al. 2014's VizieR BJD and DACE's own recomputed BJD
+for the identical exposure. The window also widens further per-pair when
+a source's timestamps are written with visibly less decimal precision
+than the row it's being compared against (e.g. Batalha et al. 2011's
+archival HIRES BJDs for Kepler-10 have only 2-3 decimal digits -- DACE has
+since re-published the same exposures under Weiss et al. 2024 with 4-5 --
+even 90s isn't always enough, since the coarser timestamp can be off by
+its own rounding step on top of the timescale gap).
 
 Exactly one row per duplicate group is kept, and the rest are dropped --
 the aggregated output never contains more than one row per observation.
