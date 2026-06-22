@@ -43,7 +43,18 @@ import pandas as pd
 from .ads_search import RV_INSTRUMENTS
 from .download import sanitize
 
-DUPLICATE_WINDOW_SECONDS = 10.0
+# Wide enough to absorb a real, bounded, named systematic: some pipelines
+# report BJD on the UTC timescale, others on the modern TDB/TT standard
+# (Eastman et al. 2010) -- the gap between them is exactly the current
+# leap-second offset, TT - UTC = (TAI - UTC) + 32.184s, which has been
+# 69.184s since the last leap second (2017) and was 67.184s as far back as
+# 2012. Confirmed against a real pair: Kepler-10's HARPS-N exposure from
+# 2013-07-08 differs by 67.64s between Dumusque et al. 2014's VizieR BJD
+# and DACE's own recomputed BJD for the identical exposure -- matching the
+# 2013-era TT-UTC offset (67.184s) to within barycentric-correction
+# rounding. Not a generic "be more lenient" number: it's sized to this
+# specific, well-documented effect, plus headroom.
+DUPLICATE_WINDOW_SECONDS = 90.0
 
 DEFAULT_CONFIG = {
     # "prefer_source": always pick the row whose source_type is earliest in
@@ -317,6 +328,20 @@ def detect_vizier_instrument(columns, table_id, table_title=None):
     return found[0] if len(found) == 1 else f"table:{table_id}"
 
 
+def decimal_text_precision(raw_value):
+    """Granularity implied by how many decimal digits a time value's
+    *original written text* has, e.g. "50682.00000" -> 5 decimals (a
+    genuinely precise, if numerically round, value). Deliberately reads
+    the raw CSV text, not a parsed float's repr: float repr silently drops
+    trailing zeros, which would make a precise-but-round value look far
+    coarser than it was actually published with (50682.00000 parses to
+    the float 50682.0, repr'd back as just "50682.0" -- 1 decimal, not 5)."""
+    s = str(raw_value).strip()
+    if not s or "e" in s.lower() or "." not in s:
+        return 0.0
+    return 10.0 ** (-len(s.split(".")[1]))
+
+
 def load_vizier_table(path, columns, table_title=None):
     time_col, offset = find_time_column(columns)
     rv_col, err_col = find_rv_columns(columns)
@@ -334,8 +359,10 @@ def load_vizier_table(path, columns, table_title=None):
     else:
         instrument = detect_vizier_instrument(columns, path.stem, table_title)
 
+    raw_time = pd.read_csv(path, comment="#", usecols=[time_col], dtype=str)[time_col]
     out = pd.DataFrame({
         "time_bjd": df[time_col].astype(float) + offset,
+        "time_precision_days": raw_time.map(decimal_text_precision),
         "rv_raw_mps": df[rv_col].astype(float) * unit_to_mps_factor(columns[rv_col]["unit"]),
         "rv_err_mps": (df[err_col].astype(float) * unit_to_mps_factor(columns[err_col]["unit"])
                        if err_col and err_col in df.columns else float("nan")),
@@ -350,6 +377,7 @@ def load_dace_table(path):
     missing = {"rjd", "rv", "rv_err"} - set(df.columns)
     if missing:
         return None, f"missing expected DACE column(s): {sorted(missing)}"
+    raw_rjd = pd.read_csv(path, comment="#", usecols=["rjd"], dtype=str)["rjd"]
 
     # DACE keeps every reprocessing of an observation under successive
     # pipeline (DRS) versions, not just the current one -- an outdated
@@ -359,7 +387,9 @@ def load_dace_table(path):
     # *different* source tables. Drop anything not flagged as the latest
     # reduction before that detection ever runs.
     if "is_latest_drs" in df.columns:
-        df = df[df["is_latest_drs"] != False].reset_index(drop=True)  # noqa: E712 (NaN must stay, only drop literal False)
+        keep = df["is_latest_drs"] != False  # noqa: E712 (NaN must stay, only drop literal False)
+        df = df[keep].reset_index(drop=True)
+        raw_rjd = raw_rjd[keep].reset_index(drop=True)
 
     rjd = df["rjd"].astype(float)
     if "pub_bibcode" in df.columns:
@@ -367,6 +397,7 @@ def load_dace_table(path):
 
     out = pd.DataFrame({
         "time_bjd": rjd + 2400000.0,
+        "time_precision_days": raw_rjd.map(decimal_text_precision),
         "rv_raw_mps": df["rv"].astype(float),
         "rv_err_mps": df["rv_err"].astype(float),
         "instrument": (df["instrument_name"].map(lambda v: DACE_INSTRUMENT_ALIASES.get(str(v), v))
@@ -406,40 +437,36 @@ def load_source_file(path):
     return df, None
 
 
-def time_precision_days(value):
-    """Granularity implied by how many decimal digits a time value was
-    written with (e.g. "...075.773" -> 0.001 days, ~86s). Some sources
-    round their published timestamps far more coarsely than others
-    reporting the very same observation (confirmed for Kepler-10: Batalha
-    et al. 2011's archival HIRES BJDs have 2-3 decimal digits, while Weiss
-    et al. 2024's re-publication of the same exposures has 4-5) -- a fixed
-    matching window sized for the *precise* side would otherwise miss
-    these pairs entirely, since the coarse side can legitimately be off by
-    up to half its own rounding step. Returns 0.0 if `value` has no
-    decimal part to measure (an exact value, or scientific notation).
-    """
-    s = repr(float(value))
-    if "e" in s.lower() or "." not in s:
-        return 0.0
-    return 10.0 ** (-len(s.split(".")[1]))
-
-
 def find_duplicate_groups(df, window_seconds=DUPLICATE_WINDOW_SECONDS):
-    """Union-find over rows sharing an instrument, sorted by time: any two
-    rows within the matching tolerance of each other are linked
-    (transitively) into the same group, *unless* they come from the exact
-    same (source_table, source_bibcode) pair -- two rows that close
-    together from the very same table and publication are a real,
-    intentional pair of observations, not a duplicate. Rows from a
-    different table, or from the same DACE download but tagged with a
-    different publication bibcode (DACE keeps re-submitted/reprocessed
-    historical data under its new paper's bibcode without removing the
-    original paper's own copy), are linked.
+    """Greedy, constrained union-find over rows sharing an instrument,
+    sorted by time: candidate pairs within the matching tolerance of each
+    other are merged into the same group, closest-in-time first, *except*
+    a merge is refused whenever it would put two rows sharing the same
+    (source_table, source_bibcode) key into one group -- two rows from the
+    very same table and publication are a real, intentional pair of
+    observations from that pipeline, never a duplicate of each other, no
+    matter how they'd otherwise get chained together transitively through
+    a third row from a different source. (A transitive chain matters: a
+    coarsely-timed third row can sit within tolerance of two *other* rows
+    that are themselves genuinely distinct observations sharing one
+    pipeline -- naive transitive linking would wrongly merge those two
+    together. Processing merges in increasing time-gap order and refusing
+    any that would violate the one-row-per-key invariant avoids that.)
+
+    Rows from a different table, or from the same DACE download but
+    tagged with a different publication bibcode (DACE keeps
+    re-submitted/reprocessed historical data under its new paper's
+    bibcode without removing the original paper's own copy), are eligible
+    to merge.
 
     The matching tolerance is `window_seconds`, widened per-pair to half
-    the coarser of the two rows' own apparent timestamp rounding (see
-    time_precision_days) -- so a coarsely-rounded source isn't compared
-    against a precise one using a tolerance sized for the precise side.
+    the coarser of the two rows' own apparent timestamp rounding (the
+    `time_precision_days` column set by load_vizier_table/load_dace_table
+    from each row's *original written text* -- not the parsed time_bjd
+    float, whose repr silently drops trailing zeros and would make a
+    precise-but-round value look far coarser than it really was) -- so a
+    coarsely-rounded source isn't compared against a precise one using a
+    tolerance sized for the precise side.
 
     Returns a Series aligned to df.index: an integer group id for rows
     with at least one match, NA otherwise.
@@ -447,19 +474,6 @@ def find_duplicate_groups(df, window_seconds=DUPLICATE_WINDOW_SECONDS):
     window_days = window_seconds / 86400.0
     n = len(df)
     parent = list(range(n))
-
-    def find(i):
-        root = i
-        while parent[root] != root:
-            root = parent[root]
-        while parent[i] != root:
-            parent[i], i = root, parent[i]
-        return root
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[ri] = rj
 
     def table_bibcode_key(i):
         # A missing bibcode must compare equal to another missing bibcode
@@ -470,24 +484,56 @@ def find_duplicate_groups(df, window_seconds=DUPLICATE_WINDOW_SECONDS):
         bibcode = df.at[i, "source_bibcode"]
         return df.at[i, "source_table"], bibcode if pd.notna(bibcode) else None
 
-    tol = (df["time_bjd"].map(time_precision_days) / 2).clip(lower=window_days)
+    keys_by_root = {i: {table_bibcode_key(i)} for i in range(n)}
+
+    def find(i):
+        root = i
+        while parent[root] != root:
+            root = parent[root]
+        while parent[i] != root:
+            parent[i], i = root, parent[i]
+        return root
+
+    def try_union(i, j):
+        """Merge i's and j's groups unless that would put two same-keyed
+        rows in one group; returns whether the merge happened."""
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            return False
+        if keys_by_root[ri] & keys_by_root[rj]:
+            return False
+        parent[ri] = rj
+        keys_by_root[rj] |= keys_by_root.pop(ri)
+        return True
+
+    precision = df["time_precision_days"] if "time_precision_days" in df.columns else pd.Series(0.0, index=df.index)
+    tol = (precision.fillna(0.0) / 2).clip(lower=window_days)
 
     for _, idx in df.groupby("instrument").groups.items():
         order = sorted(idx, key=lambda i: df.at[i, "time_bjd"])
         # A safe (possibly loose) upper bound to scan to -- the actual
-        # union below still applies the precise per-pair tolerance, so
+        # merge below still applies the precise per-pair tolerance, so
         # scanning a few extra candidates here costs time, not correctness.
         max_tol = tol.loc[order].max() if len(order) else window_days
+
+        candidates = []
         for a in range(len(order)):
             i = order[a]
             b = a + 1
             while b < len(order) and df.at[order[b], "time_bjd"] - df.at[i, "time_bjd"] <= max_tol:
                 j = order[b]
+                dt = df.at[j, "time_bjd"] - df.at[i, "time_bjd"]
                 pair_tol = max(tol.at[i], tol.at[j])
-                if (df.at[j, "time_bjd"] - df.at[i, "time_bjd"] <= pair_tol
-                        and table_bibcode_key(i) != table_bibcode_key(j)):
-                    union(i, j)
+                if dt <= pair_tol and table_bibcode_key(i) != table_bibcode_key(j):
+                    candidates.append((dt, i, j))
                 b += 1
+
+        # Closest-in-time pairs claim a group first, so a genuine
+        # duplicate pair is merged before a more-distant, coarser-timed
+        # row gets the chance to bridge two unrelated same-pipeline rows
+        # together (see try_union).
+        for _, i, j in sorted(candidates, key=lambda c: c[0]):
+            try_union(i, j)
 
     roots = pd.Series([find(i) for i in range(n)], index=df.index)
     counts = roots.value_counts()
@@ -570,6 +616,7 @@ def aggregate_host(host_dir, hostname, config, window_seconds=DUPLICATE_WINDOW_S
     is_preferred = choose_preferred(combined, combined["duplicate_group"], config)
     n_dropped = int((~is_preferred).sum())
     combined = combined[is_preferred].reset_index(drop=True)
+    combined = combined.drop(columns=["time_precision_days"])  # internal to find_duplicate_groups only
 
     combined.insert(0, "host", hostname)
     combined = combined.sort_values("time_bjd").reset_index(drop=True)
