@@ -429,7 +429,15 @@ def load_source_file(path):
 
     if "source_bibcode" not in df.columns:
         df["source_bibcode"] = bibcode
-    else:
+    elif bibcode is not None:
+        # Only fill in the header's fallback bibcode when there is one --
+        # passing fillna(None) itself (as opposed to just never calling it)
+        # raises ValueError on some pandas versions ("Must specify a fill
+        # 'value' or 'method'"), which is exactly what happens for a DACE
+        # table with no resolved provenance reference (its "Triggered by:"
+        # line is the generic "queried directly" text, not a bibcode) and
+        # rows whose own pub_bibcode is missing -- there's nothing to fall
+        # back to, so those rows' source_bibcode should just stay NaN.
         df["source_bibcode"] = df["source_bibcode"].fillna(bibcode)
     df["source_table"] = path.name
     df["source_type"] = source_type
