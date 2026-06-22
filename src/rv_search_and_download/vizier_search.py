@@ -1,4 +1,4 @@
-"""For each hostname in a NASA Exoplanet Archive multis CSV, aggregate the unique
+"""For each hostname in a NASA Exoplanet Archive CSV, aggregate the unique
 literature references cited for that system and check VizieR (by ADS bibcode)
 for an associated table that looks like a radial-velocity dataset.
 
